@@ -1,7 +1,10 @@
 import puppeteer from "@cloudflare/puppeteer";
 
-const VERSION = "siona-hybrid-v5";
+const VERSION = "siona-hybrid-v6";
 const MAX_TEXT_LENGTH = 50_000;
+const MAX_BATCH_SIZE = 5;
+const FETCH_TIMEOUT_MS = 15_000;
+const BROWSER_TIMEOUT_MS = 30_000;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -9,11 +12,11 @@ function json(data, status = 200) {
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
       "Cache-Control": "no-store, no-cache, must-revalidate",
-      "Pragma": "no-cache",
-      "Expires": "0"
+      Pragma: "no-cache",
+      Expires: "0"
     }
   });
 }
@@ -135,10 +138,6 @@ function decodeBuffer(buffer, encoding) {
 async function decodeResponse(response) {
   const buffer = await response.arrayBuffer();
 
-  /*
-   * Bazı sunucular yanlış charset başlığı döndürebildiği için
-   * UTF-8 ve Windows-1252 sonuçlarını karşılaştırıyoruz.
-   */
   const utf8Text = decodeBuffer(buffer, "utf-8");
   const windowsText = decodeBuffer(buffer, "windows-1252");
 
@@ -169,6 +168,143 @@ function needsBrowser(status, html, text) {
   );
 }
 
+function isPrivateOrLocalHostname(hostname) {
+  const value = hostname.toLowerCase();
+
+  if (
+    value === "localhost" ||
+    value.endsWith(".localhost") ||
+    value.endsWith(".local")
+  ) {
+    return true;
+  }
+
+  if (
+    /^127\./.test(value) ||
+    /^10\./.test(value) ||
+    /^192\.168\./.test(value) ||
+    /^169\.254\./.test(value)
+  ) {
+    return true;
+  }
+
+  const match172 = value.match(/^172\.(\d+)\./);
+
+  if (match172) {
+    const secondOctet = Number(match172[1]);
+
+    if (secondOctet >= 16 && secondOctet <= 31) {
+      return true;
+    }
+  }
+
+  return (
+    value === "0.0.0.0" ||
+    value === "::1" ||
+    value.startsWith("fc") ||
+    value.startsWith("fd") ||
+    value.startsWith("fe80:")
+  );
+}
+
+function parseAndValidateUrl(input) {
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(input);
+  } catch {
+    throw new Error("Geçersiz URL");
+  }
+
+  if (
+    parsedUrl.protocol !== "http:" &&
+    parsedUrl.protocol !== "https:"
+  ) {
+    throw new Error("Yalnızca HTTP ve HTTPS destekleniyor");
+  }
+
+  if (isPrivateOrLocalHostname(parsedUrl.hostname)) {
+    throw new Error("Yerel veya özel ağ adreslerine erişim yasak");
+  }
+
+  return parsedUrl;
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function tryFastFetch(url) {
+  try {
+    const response = await fetchWithTimeout(
+      url,
+      {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (compatible; SionaBot/1.0; +https://aisiona.com)",
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language":
+            "tr-TR,tr;q=0.9,en;q=0.8"
+        },
+        redirect: "follow"
+      },
+      FETCH_TIMEOUT_MS
+    );
+
+    const contentType =
+      response.headers.get("content-type") || "";
+
+    if (!contentType.toLowerCase().includes("text/html")) {
+      return {
+        requiresBrowser: true,
+        reason: `HTML olmayan içerik: ${contentType || "bilinmiyor"}`
+      };
+    }
+
+    const html = await decodeResponse(response);
+    const cleaned = cleanHtml(html);
+
+    if (needsBrowser(response.status, html, cleaned.text)) {
+      return {
+        requiresBrowser: true,
+        reason: "Sayfa JavaScript veya browser gerektiriyor"
+      };
+    }
+
+    return {
+      requiresBrowser: false,
+      result: {
+        success: response.ok,
+        method: "fetch",
+        status: response.status,
+        finalUrl: response.url,
+        title: cleaned.title,
+        textLength: cleaned.text.length,
+        text: cleaned.text.slice(0, MAX_TEXT_LENGTH)
+      }
+    };
+  } catch (error) {
+    return {
+      requiresBrowser: true,
+      reason:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+  }
+}
+
 async function scrapeWithBrowser(url, env) {
   let browser;
 
@@ -189,7 +325,7 @@ async function scrapeWithBrowser(url, env) {
 
     await page.goto(url, {
       waitUntil: "networkidle2",
-      timeout: 30_000
+      timeout: BROWSER_TIMEOUT_MS
     });
 
     const result = await page.evaluate(() => {
@@ -214,6 +350,7 @@ async function scrapeWithBrowser(url, env) {
     return {
       success: true,
       method: "browser",
+      status: 200,
       finalUrl: page.url(),
       title,
       textLength: text.length,
@@ -226,6 +363,248 @@ async function scrapeWithBrowser(url, env) {
   }
 }
 
+async function scrapeSingleUrl(url, env) {
+  const parsedUrl = parseAndValidateUrl(url);
+  const normalizedUrl = parsedUrl.toString();
+
+  const fastResult = await tryFastFetch(normalizedUrl);
+
+  if (!fastResult.requiresBrowser) {
+    return {
+      requestedUrl: normalizedUrl,
+      ...fastResult.result
+    };
+  }
+
+  try {
+    const browserResult = await scrapeWithBrowser(
+      normalizedUrl,
+      env
+    );
+
+    return {
+      requestedUrl: normalizedUrl,
+      ...browserResult
+    };
+  } catch (error) {
+    return {
+      requestedUrl: normalizedUrl,
+      success: false,
+      method: "browser",
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error),
+      fallbackReason: fastResult.reason
+    };
+  }
+}
+
+async function handleSingleRequest(request, env) {
+  const requestUrl = new URL(request.url);
+  const targetUrl = requestUrl.searchParams.get("url");
+
+  if (!targetUrl) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: "URL gerekli",
+        example: "/?url=https://example.com"
+      },
+      400
+    );
+  }
+
+  try {
+    const result = await scrapeSingleUrl(targetUrl, env);
+
+    return json({
+      version: VERSION,
+      ...result
+    });
+  } catch (error) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error)
+      },
+      400
+    );
+  }
+}
+
+async function handleBatchRequest(request, env) {
+  let body;
+
+  try {
+    body = await request.json();
+  } catch {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: "Geçerli JSON gövdesi gerekli"
+      },
+      400
+    );
+  }
+
+  if (!Array.isArray(body.urls)) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: '"urls" bir dizi olmalı'
+      },
+      400
+    );
+  }
+
+  const urls = [
+    ...new Set(
+      body.urls
+        .filter((url) => typeof url === "string")
+        .map((url) => url.trim())
+        .filter(Boolean)
+    )
+  ];
+
+  if (urls.length === 0) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: "En az bir URL gerekli"
+      },
+      400
+    );
+  }
+
+  if (urls.length > MAX_BATCH_SIZE) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: `Tek batch içinde en fazla ${MAX_BATCH_SIZE} URL gönderilebilir`
+      },
+      400
+    );
+  }
+
+  const startedAt = Date.now();
+
+  const validatedItems = urls.map((url, index) => {
+    try {
+      const parsedUrl = parseAndValidateUrl(url);
+
+      return {
+        index,
+        url: parsedUrl.toString(),
+        valid: true
+      };
+    } catch (error) {
+      return {
+        index,
+        url,
+        valid: false,
+        result: {
+          requestedUrl: url,
+          success: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error)
+        }
+      };
+    }
+  });
+
+  const validItems = validatedItems.filter(
+    (item) => item.valid
+  );
+
+  // Normal HTTP çekimleri paralel çalışır.
+  const fastResults = await Promise.all(
+    validItems.map(async (item) => ({
+      item,
+      fastResult: await tryFastFetch(item.url)
+    }))
+  );
+
+  const resultsByIndex = new Map();
+
+  for (const item of validatedItems) {
+    if (!item.valid) {
+      resultsByIndex.set(item.index, item.result);
+    }
+  }
+
+  const browserQueue = [];
+
+  for (const entry of fastResults) {
+    if (!entry.fastResult.requiresBrowser) {
+      resultsByIndex.set(entry.item.index, {
+        requestedUrl: entry.item.url,
+        ...entry.fastResult.result
+      });
+    } else {
+      browserQueue.push(entry);
+    }
+  }
+
+  /*
+   * Browser açılışlarını kontrollü tutmak için fallback işleri
+   * sırayla çalıştırılıyor. Normal fetch işlemleri zaten paralel.
+   */
+  for (const entry of browserQueue) {
+    try {
+      const browserResult = await scrapeWithBrowser(
+        entry.item.url,
+        env
+      );
+
+      resultsByIndex.set(entry.item.index, {
+        requestedUrl: entry.item.url,
+        ...browserResult
+      });
+    } catch (error) {
+      resultsByIndex.set(entry.item.index, {
+        requestedUrl: entry.item.url,
+        success: false,
+        method: "browser",
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+        fallbackReason: entry.fastResult.reason
+      });
+    }
+  }
+
+  const results = validatedItems.map((item) =>
+    resultsByIndex.get(item.index)
+  );
+
+  const successful = results.filter(
+    (result) => result?.success
+  ).length;
+
+  return json({
+    version: VERSION,
+    success: successful > 0,
+    requested: urls.length,
+    successful,
+    failed: urls.length - successful,
+    durationMs: Date.now() - startedAt,
+    results
+  });
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
@@ -233,7 +612,7 @@ export default {
         status: 204,
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, OPTIONS",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
           "Access-Control-Allow-Headers": "Content-Type",
           "Cache-Control": "no-store"
         }
@@ -241,106 +620,33 @@ export default {
     }
 
     const requestUrl = new URL(request.url);
-    const targetUrl = requestUrl.searchParams.get("url");
 
-    if (!targetUrl) {
-      return json(
-        {
-          version: VERSION,
-          success: false,
-          error: "URL gerekli",
-          example: "?url=https://example.com"
-        },
-        400
-      );
+    if (
+      request.method === "POST" &&
+      requestUrl.pathname === "/batch"
+    ) {
+      return handleBatchRequest(request, env);
     }
 
-    let parsedUrl;
-
-    try {
-      parsedUrl = new URL(targetUrl);
-
-      if (
-        parsedUrl.protocol !== "http:" &&
-        parsedUrl.protocol !== "https:"
-      ) {
-        throw new Error("Geçersiz protokol");
-      }
-    } catch {
-      return json(
-        {
-          version: VERSION,
-          success: false,
-          error: "Geçersiz URL"
-        },
-        400
-      );
+    if (
+      request.method === "GET" &&
+      (requestUrl.pathname === "/" ||
+        requestUrl.pathname === "/scrape")
+    ) {
+      return handleSingleRequest(request, env);
     }
 
-    try {
-      const response = await fetch(parsedUrl.toString(), {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (compatible; SionaBot/1.0; +https://aisiona.com)",
-          "Accept":
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language":
-            "tr-TR,tr;q=0.9,en;q=0.8"
-        },
-        redirect: "follow"
-      });
-
-      const contentType =
-        response.headers.get("content-type") || "";
-
-      if (contentType.toLowerCase().includes("text/html")) {
-        const html = await decodeResponse(response);
-        const cleaned = cleanHtml(html);
-
-        if (
-          !needsBrowser(
-            response.status,
-            html,
-            cleaned.text
-          )
-        ) {
-          return json({
-            version: VERSION,
-            success: response.ok,
-            method: "fetch",
-            status: response.status,
-            finalUrl: response.url,
-            title: cleaned.title,
-            textLength: cleaned.text.length,
-            text: cleaned.text.slice(
-              0,
-              MAX_TEXT_LENGTH
-            )
-          });
-        }
-      }
-
-      const browserResult = await scrapeWithBrowser(
-        parsedUrl.toString(),
-        env
-      );
-
-      return json({
+    return json(
+      {
         version: VERSION,
-        ...browserResult
-      });
-    } catch (error) {
-      return json(
-        {
-          version: VERSION,
-          success: false,
-          error:
-            error instanceof Error
-              ? error.message
-              : String(error)
-        },
-        502
-      );
-    }
+        success: false,
+        error: "Endpoint bulunamadı",
+        endpoints: {
+          single: "GET /?url=https://example.com",
+          batch: "POST /batch"
+        }
+      },
+      404
+    );
   }
 };
