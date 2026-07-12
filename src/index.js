@@ -29,7 +29,7 @@ function cleanHtml(html) {
 function needsBrowser(status, html, text) {
   if (status >= 400) return true;
   if (!html || html.length < 500) return true;
-  if (text.length < 300) return true;
+  if (text.length < 80) return true;
 
   const lower = html.toLowerCase();
 
