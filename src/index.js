@@ -1,6 +1,6 @@
 import puppeteer from "@cloudflare/puppeteer";
 
-const VERSION = "siona-hybrid-v6";
+const VERSION = "siona-hybrid-v7";
 const MAX_TEXT_LENGTH = 50_000;
 const MAX_BATCH_SIZE = 5;
 const FETCH_TIMEOUT_MS = 15_000;
@@ -164,8 +164,22 @@ function needsBrowser(status, html, text) {
     lowerHtml.includes("checking your browser") ||
     lowerHtml.includes("just a moment") ||
     lowerHtml.includes("cf-chl-") ||
+    lowerHtml.includes("loading...") ||
     (lowerHtml.includes("__next_data__") && text.length < 800)
   );
+}
+
+function isFlashscoreMatchPage(url) {
+  try {
+    const parsedUrl = new URL(url);
+
+    return (
+      parsedUrl.hostname.includes("flashscore.") &&
+      parsedUrl.pathname.includes("/mac/")
+    );
+  } catch {
+    return false;
+  }
 }
 
 function isPrivateOrLocalHostname(hostname) {
@@ -245,6 +259,13 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 }
 
 async function tryFastFetch(url) {
+  if (isFlashscoreMatchPage(url)) {
+    return {
+      requiresBrowser: true,
+      reason: "Flashscore maç sayfası browser ile açılmalı"
+    };
+  }
+
   try {
     const response = await fetchWithTimeout(
       url,
@@ -323,37 +344,74 @@ async function scrapeWithBrowser(url, env) {
       "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8"
     });
 
+    await page.setViewport({
+      width: 1440,
+      height: 1200
+    });
+
     await page.goto(url, {
-      waitUntil: "networkidle2",
+      waitUntil: "domcontentloaded",
       timeout: BROWSER_TIMEOUT_MS
     });
 
+    if (isFlashscoreMatchPage(url)) {
+      try {
+        await page.waitForFunction(
+          () => {
+            const bodyText = document.body?.innerText || "";
+
+            return (
+              !bodyText.includes("Loading...") &&
+              bodyText.length > 1000
+            );
+          },
+          {
+            timeout: 15_000
+          }
+        );
+      } catch {
+        await new Promise((resolve) =>
+          setTimeout(resolve, 5_000)
+        );
+      }
+    } else {
+      try {
+        await page.waitForNetworkIdle({
+          idleTime: 1_000,
+          timeout: 10_000
+        });
+      } catch {
+        // Bazı sitelerde ağ hiç tamamen boş kalmayabilir.
+      }
+    }
+
     const result = await page.evaluate(() => {
-      document
-        .querySelectorAll(
-          "script, style, noscript, svg, iframe, nav, footer"
-        )
-        .forEach((element) => element.remove());
+      const title = document.title || "";
+
+      const text =
+        document.body?.innerText
+          ?.replace(/\s+/g, " ")
+          .trim() || "";
 
       return {
-        title: document.title || "",
-        text:
-          document.body?.innerText
-            ?.replace(/\s+/g, " ")
-            .trim() || ""
+        title,
+        text
       };
     });
 
     const title = normalizeText(result.title);
     const text = normalizeText(result.text);
 
+    const stillLoading = text.includes("Loading...");
+
     return {
-      success: true,
+      success: !stillLoading && text.length > 80,
       method: "browser",
       status: 200,
       finalUrl: page.url(),
       title,
       textLength: text.length,
+      stillLoading,
       text: text.slice(0, MAX_TEXT_LENGTH)
     };
   } finally {
@@ -384,6 +442,7 @@ async function scrapeSingleUrl(url, env) {
 
     return {
       requestedUrl: normalizedUrl,
+      fallbackReason: fastResult.reason,
       ...browserResult
     };
   } catch (error) {
@@ -498,100 +557,25 @@ async function handleBatchRequest(request, env) {
 
   const startedAt = Date.now();
 
-  const validatedItems = urls.map((url, index) => {
-    try {
-      const parsedUrl = parseAndValidateUrl(url);
-
-      return {
-        index,
-        url: parsedUrl.toString(),
-        valid: true
-      };
-    } catch (error) {
-      return {
-        index,
-        url,
-        valid: false,
-        result: {
+  const results = await Promise.all(
+    urls.map(async (url) => {
+      try {
+        return await scrapeSingleUrl(url, env);
+      } catch (error) {
+        return {
           requestedUrl: url,
           success: false,
           error:
             error instanceof Error
               ? error.message
               : String(error)
-        }
-      };
-    }
-  });
-
-  const validItems = validatedItems.filter(
-    (item) => item.valid
-  );
-
-  // Normal HTTP çekimleri paralel çalışır.
-  const fastResults = await Promise.all(
-    validItems.map(async (item) => ({
-      item,
-      fastResult: await tryFastFetch(item.url)
-    }))
-  );
-
-  const resultsByIndex = new Map();
-
-  for (const item of validatedItems) {
-    if (!item.valid) {
-      resultsByIndex.set(item.index, item.result);
-    }
-  }
-
-  const browserQueue = [];
-
-  for (const entry of fastResults) {
-    if (!entry.fastResult.requiresBrowser) {
-      resultsByIndex.set(entry.item.index, {
-        requestedUrl: entry.item.url,
-        ...entry.fastResult.result
-      });
-    } else {
-      browserQueue.push(entry);
-    }
-  }
-
-  /*
-   * Browser açılışlarını kontrollü tutmak için fallback işleri
-   * sırayla çalıştırılıyor. Normal fetch işlemleri zaten paralel.
-   */
-  for (const entry of browserQueue) {
-    try {
-      const browserResult = await scrapeWithBrowser(
-        entry.item.url,
-        env
-      );
-
-      resultsByIndex.set(entry.item.index, {
-        requestedUrl: entry.item.url,
-        ...browserResult
-      });
-    } catch (error) {
-      resultsByIndex.set(entry.item.index, {
-        requestedUrl: entry.item.url,
-        success: false,
-        method: "browser",
-        error:
-          error instanceof Error
-            ? error.message
-            : String(error),
-        fallbackReason: entry.fastResult.reason
-      });
-    }
-  }
-
-  const results = validatedItems.map((item) =>
-    resultsByIndex.get(item.index)
+        };
+      }
+    })
   );
 
   const successful = results.filter(
-    (result) => result?.success
+    (result) => result.success
   ).length;
 
   return json({
@@ -630,8 +614,10 @@ export default {
 
     if (
       request.method === "GET" &&
-      (requestUrl.pathname === "/" ||
-        requestUrl.pathname === "/scrape")
+      (
+        requestUrl.pathname === "/" ||
+        requestUrl.pathname === "/scrape"
+      )
     ) {
       return handleSingleRequest(request, env);
     }
