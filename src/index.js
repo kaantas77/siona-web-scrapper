@@ -1,53 +1,21 @@
 import puppeteer from "@cloudflare/puppeteer";
 
-const VERSION = "siona-hybrid-v4";
+const VERSION = "siona-hybrid-v5";
 const MAX_TEXT_LENGTH = 50_000;
 
 function json(data, status = 200) {
-  return Response.json(data, {
+  return new Response(JSON.stringify(data), {
     status,
     headers: {
+      "Content-Type": "application/json; charset=utf-8",
       "Access-Control-Allow-Origin": "*",
-      "Cache-Control": "no-store"
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+      "Pragma": "no-cache",
+      "Expires": "0"
     }
   });
-}
-
-function fixMojibake(text) {
-  const replacements = [
-    ["Ã‡", "Ç"],
-    ["Ã§", "ç"],
-    ["Äž", "Ğ"],
-    ["ÄŸ", "ğ"],
-    ["Ä°", "İ"],
-    ["Ä±", "ı"],
-    ["Ã–", "Ö"],
-    ["Ã¶", "ö"],
-    ["Åž", "Ş"],
-    ["ÅŸ", "ş"],
-    ["Ãœ", "Ü"],
-    ["Ã¼", "ü"],
-
-    ["â€™", "'"],
-    ["â€˜", "'"],
-    ["â€œ", '"'],
-    ["â€", '"'],
-    ["â€“", "-"],
-    ["â€”", "—"],
-    ["â€¦", "…"],
-
-    ["Â©", "©"],
-    ["Â®", "®"],
-    ["Â", ""]
-  ];
-
-  let result = text;
-
-  for (const [broken, correct] of replacements) {
-    result = result.split(broken).join(correct);
-  }
-
-  return result;
 }
 
 function decodeHtmlEntities(text) {
@@ -76,6 +44,43 @@ function decodeHtmlEntities(text) {
     });
 }
 
+function fixMojibake(text) {
+  const replacements = [
+    ["Ã‡", "Ç"],
+    ["Ã§", "ç"],
+    ["Äž", "Ğ"],
+    ["ÄŸ", "ğ"],
+    ["Ä°", "İ"],
+    ["Ä±", "ı"],
+    ["Ã–", "Ö"],
+    ["Ã¶", "ö"],
+    ["Åž", "Ş"],
+    ["ÅŸ", "ş"],
+    ["Ãœ", "Ü"],
+    ["Ã¼", "ü"],
+    ["â€™", "'"],
+    ["â€˜", "'"],
+    ["â€œ", '"'],
+    ["â€", '"'],
+    ["â€“", "-"],
+    ["â€”", "—"],
+    ["â€¦", "…"],
+    ["Â©", "©"],
+    ["Â®", "®"],
+    ["Â", ""]
+  ];
+
+  let result = text;
+
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (const [broken, correct] of replacements) {
+      result = result.split(broken).join(correct);
+    }
+  }
+
+  return result;
+}
+
 function normalizeText(text) {
   return fixMojibake(
     decodeHtmlEntities(text)
@@ -90,10 +95,7 @@ function cleanHtml(html) {
     html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
 
   const title = normalizeText(
-    rawTitle
-      .replace(/<[^>]+>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
+    rawTitle.replace(/<[^>]+>/g, " ")
   );
 
   const rawText = html
@@ -109,12 +111,45 @@ function cleanHtml(html) {
     )
     .replace(/<[^>]+>/g, " ");
 
-  const text = normalizeText(rawText);
-
   return {
     title,
-    text
+    text: normalizeText(rawText)
   };
+}
+
+function mojibakeScore(text) {
+  const matches = text.match(/[ÃÄÅÂâ€]/g);
+  return matches ? matches.length : 0;
+}
+
+function decodeBuffer(buffer, encoding) {
+  try {
+    return new TextDecoder(encoding, {
+      fatal: false
+    }).decode(buffer);
+  } catch {
+    return "";
+  }
+}
+
+async function decodeResponse(response) {
+  const buffer = await response.arrayBuffer();
+
+  /*
+   * Bazı sunucular yanlış charset başlığı döndürebildiği için
+   * UTF-8 ve Windows-1252 sonuçlarını karşılaştırıyoruz.
+   */
+  const utf8Text = decodeBuffer(buffer, "utf-8");
+  const windowsText = decodeBuffer(buffer, "windows-1252");
+
+  const utf8Score = mojibakeScore(utf8Text);
+  const windowsScore = mojibakeScore(windowsText);
+
+  if (utf8Text && utf8Score <= windowsScore) {
+    return utf8Text;
+  }
+
+  return windowsText || utf8Text;
 }
 
 function needsBrowser(status, html, text) {
@@ -132,35 +167,6 @@ function needsBrowser(status, html, text) {
     lowerHtml.includes("cf-chl-") ||
     (lowerHtml.includes("__next_data__") && text.length < 800)
   );
-}
-
-async function decodeResponse(response) {
-  const buffer = await response.arrayBuffer();
-
-  const contentType =
-    response.headers.get("content-type") || "";
-
-  const charsetMatch = contentType.match(
-    /charset\s*=\s*["']?([^;"'\s]+)/i
-  );
-
-  const declaredCharset =
-    charsetMatch?.[1]?.trim().toLowerCase() || "utf-8";
-
-  const charsetAliases = {
-    utf8: "utf-8",
-    latin1: "windows-1252",
-    "iso-8859-1": "windows-1252"
-  };
-
-  const charset =
-    charsetAliases[declaredCharset] || declaredCharset;
-
-  try {
-    return new TextDecoder(charset).decode(buffer);
-  } catch {
-    return new TextDecoder("utf-8").decode(buffer);
-  }
 }
 
 async function scrapeWithBrowser(url, env) {
@@ -193,16 +199,12 @@ async function scrapeWithBrowser(url, env) {
         )
         .forEach((element) => element.remove());
 
-      const title = document.title || "";
-
-      const text =
-        document.body?.innerText
-          ?.replace(/\s+/g, " ")
-          .trim() || "";
-
       return {
-        title,
-        text
+        title: document.title || "",
+        text:
+          document.body?.innerText
+            ?.replace(/\s+/g, " ")
+            .trim() || ""
       };
     });
 
@@ -232,7 +234,8 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type"
+          "Access-Control-Allow-Headers": "Content-Type",
+          "Cache-Control": "no-store"
         }
       });
     }
@@ -257,7 +260,10 @@ export default {
     try {
       parsedUrl = new URL(targetUrl);
 
-      if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+      if (
+        parsedUrl.protocol !== "http:" &&
+        parsedUrl.protocol !== "https:"
+      ) {
         throw new Error("Geçersiz protokol");
       }
     } catch {
@@ -287,7 +293,7 @@ export default {
       const contentType =
         response.headers.get("content-type") || "";
 
-      if (contentType.includes("text/html")) {
+      if (contentType.toLowerCase().includes("text/html")) {
         const html = await decodeResponse(response);
         const cleaned = cleanHtml(html);
 
