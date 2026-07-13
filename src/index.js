@@ -16,6 +16,16 @@ const FETCH_TIMEOUT_MS = 15_000;
 const BROWSER_TIMEOUT_MS = 30_000;
 const MAX_QUEUE_ATTEMPTS = 3;
 
+const EXTRACTION_MODES = new Set([
+  "auto",
+  "generic",
+  "article",
+  "investing",
+  "flashscore",
+  "sofascore",
+  "raw"
+]);
+
 /* -------------------------------------------------------------------------- */
 /*                                  RESPONSE                                  */
 /* -------------------------------------------------------------------------- */
@@ -389,6 +399,21 @@ function normalizeUrlArray(
   return urls;
 }
 
+function normalizeExtractionMode(input) {
+  const mode =
+    typeof input === "string" && input.trim()
+      ? input.trim().toLowerCase()
+      : "auto";
+
+  if (!EXTRACTION_MODES.has(mode)) {
+    throw new Error(
+      'Geçersiz extract seçeneği: ' + mode
+    );
+  }
+
+  return mode;
+}
+
 /* -------------------------------------------------------------------------- */
 /*                            PAGE CLASSIFICATION                             */
 /* -------------------------------------------------------------------------- */
@@ -512,7 +537,10 @@ async function fetchWithTimeout(
   }
 }
 
-async function tryFastFetch(url) {
+async function tryFastFetch(
+  url,
+  extractionMode = "auto"
+) {
   if (isFlashscoreMatchPage(url)) {
     return {
       requiresBrowser: true,
@@ -582,7 +610,8 @@ async function tryFastFetch(url) {
       url,
       title: cleaned.title,
       text: cleaned.text,
-      rawText: cleaned.text
+      rawText: cleaned.text,
+      extractor: extractionMode
     });
 
     const outputText = extraction.success
@@ -692,7 +721,8 @@ async function waitForRenderedPage(
 
 async function scrapePageWithBrowser(
   browser,
-  url
+  url,
+  extractionMode = "auto"
 ) {
   const page =
     await browser.newPage();
@@ -748,7 +778,8 @@ async function scrapePageWithBrowser(
       url,
       title,
       text,
-      rawText: text
+      rawText: text,
+      extractor: extractionMode
     });
 
     const outputText = extraction.success
@@ -790,7 +821,8 @@ async function scrapePageWithBrowser(
 
 async function scrapeWithNewBrowser(
   url,
-  env
+  env,
+  extractionMode = "auto"
 ) {
   let browser;
 
@@ -802,7 +834,8 @@ async function scrapeWithNewBrowser(
 
     return await scrapePageWithBrowser(
       browser,
-      url
+      url,
+      extractionMode
     );
   } finally {
     if (browser) {
@@ -819,7 +852,8 @@ async function scrapeWithNewBrowser(
 
 async function scrapeSingleUrl(
   url,
-  env
+  env,
+  extractionMode = "auto"
 ) {
   const normalizedUrl =
     normalizeUrl(url);
@@ -828,7 +862,8 @@ async function scrapeSingleUrl(
 
   const fastResult =
     await tryFastFetch(
-      normalizedUrl
+      normalizedUrl,
+      extractionMode
     );
 
   if (!fastResult.requiresBrowser) {
@@ -844,7 +879,8 @@ async function scrapeSingleUrl(
     const browserResult =
       await scrapeWithNewBrowser(
         normalizedUrl,
-        env
+        env,
+        extractionMode
       );
 
     return {
@@ -914,7 +950,8 @@ function buildSynchronousResponse(
 
 async function scrapeManySynchronously(
   urls,
-  env
+  env,
+  extractionMode = "auto"
 ) {
   const startedAt = Date.now();
 
@@ -928,7 +965,7 @@ async function scrapeManySynchronously(
 
         try {
           const fastResult =
-            await tryFastFetch(url);
+            await tryFastFetch(url, extractionMode);
 
           return {
             url,
@@ -1020,7 +1057,8 @@ async function scrapeManySynchronously(
             const browserResult =
               await scrapePageWithBrowser(
                 browser,
-                item.url
+                item.url,
+                extractionMode
               );
 
             return {
@@ -1857,6 +1895,23 @@ async function handleScrapeManyRequest(
     );
   }
 
+  let extractionMode;
+
+  try {
+    extractionMode = normalizeExtractionMode(
+      body.options?.extract ?? body.extract
+    );
+  } catch (error) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: getErrorMessage(error)
+      },
+      400
+    );
+  }
+
   let urls;
 
   try {
@@ -1884,7 +1939,8 @@ async function handleScrapeManyRequest(
     const result =
       await scrapeManySynchronously(
         urls,
-        env
+        env,
+        extractionMode
       );
 
     return json(result);
@@ -1918,6 +1974,23 @@ async function handleSingleRequest(
       "url"
     );
 
+  let extractionMode;
+
+  try {
+    extractionMode = normalizeExtractionMode(
+      requestUrl.searchParams.get("extract")
+    );
+  } catch (error) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: getErrorMessage(error)
+      },
+      400
+    );
+  }
+
   if (!targetUrl) {
     return json(
       {
@@ -1935,7 +2008,8 @@ async function handleSingleRequest(
     const result =
       await scrapeSingleUrl(
         targetUrl,
-        env
+        env,
+        extractionMode
       );
 
     return json({
@@ -1976,6 +2050,23 @@ async function handleBatchRequest(
     );
   }
 
+  let extractionMode;
+
+  try {
+    extractionMode = normalizeExtractionMode(
+      body.options?.extract ?? body.extract
+    );
+  } catch (error) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: getErrorMessage(error)
+      },
+      400
+    );
+  }
+
   let urls;
 
   try {
@@ -1998,7 +2089,8 @@ async function handleBatchRequest(
   const result =
     await scrapeManySynchronously(
       urls,
-      env
+      env,
+      extractionMode
     );
 
   return json({
