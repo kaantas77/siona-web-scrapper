@@ -45,7 +45,8 @@
 
 	"vars": {
 	  "POOL_COUNT": "20",
-	  "TABS_PER_POOL": "5"
+	  "TABS_PER_POOL": "5",
+	  "POOL_ROUTING": "power-of-two"
 	},
 
 	"queues": {

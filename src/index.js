@@ -82,12 +82,60 @@ export function getBrowserPoolIndex(url, poolCount = 20) {
   return (hash >>> 0) % count;
 }
 
+export function getBrowserPoolCandidates(url, poolCount = 20) {
+  const count = Math.max(1, Number(poolCount) || 1);
+  const primary = getBrowserPoolIndex(url, count);
+  if (count === 1) return [primary];
+
+  let secondary = getBrowserPoolIndex(`${url}#secondary`, count);
+  if (secondary === primary) secondary = (primary + 1) % count;
+  return [primary, secondary];
+}
+
+async function getBrowserPoolStatus(env, poolIndex) {
+  const id = env.BROWSER_POOL.idFromName(`pool-${poolIndex}`);
+  const response = await env.BROWSER_POOL.get(id).fetch(
+    "https://browser-pool/status"
+  );
+  if (!response.ok) {
+    throw new Error(`Browser pool status failed (${response.status})`);
+  }
+
+  const body = await response.json();
+  const maxTabs = Math.max(1, Number(body.maxTabs) || 1);
+  const activeTabs = Math.max(0, Number(body.activeTabs) || 0);
+  const waiting = Math.max(0, Number(body.waiting) || 0);
+  return {
+    poolIndex,
+    score: (body.ready ? 0 : maxTabs) + activeTabs + (waiting * 2)
+  };
+}
+
+async function selectBrowserPoolIndex(url, env) {
+  const candidates = getBrowserPoolCandidates(url, env.POOL_COUNT || 20);
+  const fallback = candidates[0];
+
+  if (String(env.POOL_ROUTING || "deterministic") !== "power-of-two") {
+    return fallback;
+  }
+
+  try {
+    const statuses = await Promise.all(
+      candidates.map((poolIndex) => getBrowserPoolStatus(env, poolIndex))
+    );
+    statuses.sort((left, right) => left.score - right.score);
+    return statuses[0]?.poolIndex ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 async function scrapeWithBrowserPool(url, env, extractionMode = "auto") {
   if (!env.BROWSER_POOL) {
     throw new Error("BROWSER_POOL binding is not configured");
   }
 
-  const poolIndex = getBrowserPoolIndex(url, env.POOL_COUNT || 20);
+  const poolIndex = await selectBrowserPoolIndex(url, env);
   const id = env.BROWSER_POOL.idFromName(`pool-${poolIndex}`);
   const response = await env.BROWSER_POOL.get(id).fetch(
     "https://browser-pool/scrape",
