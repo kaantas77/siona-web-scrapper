@@ -72,6 +72,50 @@ function healthResponse() {
   });
 }
 
+export function getBrowserPoolIndex(url, poolCount = 20) {
+  const count = Math.max(1, Number(poolCount) || 1);
+  let hash = 2166136261;
+  for (const character of String(url)) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % count;
+}
+
+async function scrapeWithBrowserPool(url, env, extractionMode = "auto") {
+  if (!env.BROWSER_POOL) {
+    throw new Error("BROWSER_POOL binding is not configured");
+  }
+
+  const poolIndex = getBrowserPoolIndex(url, env.POOL_COUNT || 20);
+  const id = env.BROWSER_POOL.idFromName(`pool-${poolIndex}`);
+  const response = await env.BROWSER_POOL.get(id).fetch(
+    "https://browser-pool/scrape",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url,
+        extractor: extractionMode,
+        timeoutMs: BROWSER_TIMEOUT_MS
+      })
+    }
+  );
+
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    body = { success: false, error: "Browser pool returned invalid JSON" };
+  }
+
+  if (!response.ok) {
+    throw new Error(body.error || `Browser pool failed (${response.status})`);
+  }
+
+  return { ...body, poolIndex };
+}
+
 /* -------------------------------------------------------------------------- */
 /*                               CONCURRENCY                                  */
 /* -------------------------------------------------------------------------- */
@@ -893,12 +937,17 @@ async function scrapeSingleUrl(
   }
 
   try {
-    const browserResult =
-      await scrapeWithNewBrowser(
-        normalizedUrl,
-        env,
-        extractionMode
-      );
+    const browserResult = env.BROWSER_POOL
+      ? await scrapeWithBrowserPool(
+          normalizedUrl,
+          env,
+          extractionMode
+        )
+      : await scrapeWithNewBrowser(
+          normalizedUrl,
+          env,
+          extractionMode
+        );
 
     return {
       requestedUrl: normalizedUrl,
@@ -940,7 +989,8 @@ function buildSynchronousResponse(
   const browserCount =
     results.filter(
       (result) =>
-        result?.method === "browser"
+        result?.method === "browser" ||
+        result?.method === "browser_pool"
     ).length;
 
   const fetchCount =
@@ -1055,6 +1105,49 @@ async function scrapeManySynchronously(
       results,
       startedAt
     );
+  }
+
+  if (env.BROWSER_POOL) {
+    const browserResults = await mapWithConcurrency(
+      browserItems,
+      BROWSER_PAGE_CONCURRENCY,
+      async (item) => {
+        try {
+          const browserResult = await scrapeWithBrowserPool(
+            item.url,
+            env,
+            extractionMode
+          );
+          return {
+            index: item.index,
+            result: {
+              requestedUrl: item.url,
+              fallbackReason: item.fallbackReason,
+              durationMs: Date.now() - item.itemStartedAt,
+              ...browserResult
+            }
+          };
+        } catch (error) {
+          return {
+            index: item.index,
+            result: {
+              requestedUrl: item.url,
+              success: false,
+              method: "browser_pool",
+              fallbackReason: item.fallbackReason,
+              durationMs: Date.now() - item.itemStartedAt,
+              error: getErrorMessage(error)
+            }
+          };
+        }
+      }
+    );
+
+    for (const browserResult of browserResults) {
+      results[browserResult.index] = browserResult.result;
+    }
+
+    return buildSynchronousResponse(urls, results, startedAt);
   }
 
   let browser;
@@ -2326,6 +2419,76 @@ async function processQueueBatch(
   if (
     browserEntries.length === 0
   ) {
+    return;
+  }
+
+  if (env.BROWSER_POOL) {
+    const browserResults = await mapWithConcurrency(
+      browserEntries,
+      BROWSER_PAGE_CONCURRENCY,
+      async (entry) => {
+        try {
+          const browserResult = await scrapeWithBrowserPool(
+            entry.data.url,
+            env,
+            entry.data.extractionMode
+          );
+          return {
+            entry,
+            success: true,
+            result: {
+              requestedUrl: entry.data.url,
+              fallbackReason: entry.fallbackReason,
+              durationMs: Date.now() - entry.startedAt,
+              ...browserResult
+            }
+          };
+        } catch (error) {
+          return {
+            entry,
+            success: false,
+            error: getErrorMessage(error)
+          };
+        }
+      }
+    );
+
+    for (const browserItem of browserResults) {
+      const entry = browserItem.entry;
+      if (browserItem.success) {
+        await processQueueMessageWithResult(
+          env,
+          entry.data,
+          browserItem.result
+        );
+        entry.message.ack();
+        continue;
+      }
+
+      const errorMessage = browserItem.error;
+      if (entry.message.attempts >= MAX_QUEUE_ATTEMPTS) {
+        await markItemPermanentlyFailed(
+          env,
+          entry.data.jobId,
+          entry.data.itemId,
+          errorMessage
+        );
+        entry.message.ack();
+      } else {
+        await markItemForRetry(
+          env,
+          entry.data.itemId,
+          errorMessage
+        );
+        entry.message.retry({
+          delaySeconds: Math.min(
+            30,
+            Math.max(2, 2 ** entry.message.attempts)
+          )
+        });
+      }
+    }
+
     return;
   }
 

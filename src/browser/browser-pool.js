@@ -71,6 +71,7 @@ export class BrowserPool {
     this.state = state;
     this.env = env;
     this.browser = null;
+    this.browserPromise = null;
     this.activeTabs = 0;
     this.waiters = [];
     this.initialized = false;
@@ -83,14 +84,24 @@ export class BrowserPool {
   async ensureBrowser() {
     await this.loadState();
     if (this.browser) return this.browser;
+    if (this.browserPromise) return this.browserPromise;
     if (!this.env.BROWSER) throw new Error("BROWSER binding is not configured");
 
-    await reserveLaunchSlot(this.env);
-    this.browser = await puppeteer.launch(this.env.BROWSER);
-    await this.state.storage.put("sessionId", this.browser.sessionId || null);
-    await this.state.storage.put("lastReadyAt", new Date().toISOString());
-    await this.state.storage.setAlarm(Date.now() + KEEP_ALIVE_MS);
-    return this.browser;
+    this.browserPromise = (async () => {
+      await reserveLaunchSlot(this.env);
+      const browser = await puppeteer.launch(this.env.BROWSER);
+      this.browser = browser;
+      await this.state.storage.put("sessionId", browser.sessionId || null);
+      await this.state.storage.put("lastReadyAt", new Date().toISOString());
+      await this.state.storage.setAlarm(Date.now() + KEEP_ALIVE_MS);
+      return browser;
+    })();
+
+    try {
+      return await this.browserPromise;
+    } finally {
+      this.browserPromise = null;
+    }
   }
 
   async acquireTab() {
