@@ -72,6 +72,24 @@ function healthResponse() {
   });
 }
 
+export function summarizePoolHealth(pools) {
+  const normalized = Array.isArray(pools) ? pools : [];
+  const readyPools = normalized.filter((pool) => pool.ready).length;
+  return {
+    poolCount: normalized.length,
+    readyPools,
+    activeTabs: normalized.reduce(
+      (total, pool) => total + Math.max(0, Number(pool.activeTabs) || 0),
+      0
+    ),
+    waiting: normalized.reduce(
+      (total, pool) => total + Math.max(0, Number(pool.waiting) || 0),
+      0
+    ),
+    healthy: normalized.length > 0 && readyPools === normalized.length
+  };
+}
+
 export function getBrowserPoolIndex(url, poolCount = 20) {
   const count = Math.max(1, Number(poolCount) || 1);
   let hash = 2166136261;
@@ -109,6 +127,78 @@ async function getBrowserPoolStatus(env, poolIndex) {
     poolIndex,
     score: (body.ready ? 0 : maxTabs) + activeTabs + (waiting * 2)
   };
+}
+
+async function getBrowserPoolHealth(env, poolIndex) {
+  try {
+    const id = env.BROWSER_POOL.idFromName(`pool-${poolIndex}`);
+    const response = await env.BROWSER_POOL.get(id).fetch(
+      "https://browser-pool/status"
+    );
+    if (!response.ok) {
+      throw new Error(`Browser pool status failed (${response.status})`);
+    }
+
+    const body = await response.json();
+    return {
+      poolIndex,
+      ready: Boolean(body.ready),
+      activeTabs: Math.max(0, Number(body.activeTabs) || 0),
+      waiting: Math.max(0, Number(body.waiting) || 0),
+      maxTabs: Math.max(1, Number(body.maxTabs) || 1)
+    };
+  } catch (error) {
+    return {
+      poolIndex,
+      ready: false,
+      activeTabs: 0,
+      waiting: 0,
+      maxTabs: Math.max(1, Number(env.TABS_PER_POOL || 5)),
+      error: getErrorMessage(error)
+    };
+  }
+}
+
+async function handleDetailedHealth(env) {
+  const poolCount = Math.max(1, Number(env.POOL_COUNT || 20));
+  if (!env.BROWSER_POOL) {
+    return json({
+      version: VERSION,
+      success: true,
+      service: "siona-web-scraper",
+      architecture: "hybrid-fetch-browser",
+      browserPool: {
+        configured: false,
+        ...summarizePoolHealth([]),
+        poolCount,
+        maxTabs: Math.max(1, Number(env.TABS_PER_POOL || 5)),
+        routing: String(env.POOL_ROUTING || "deterministic")
+      }
+    });
+  }
+
+  const startedAt = Date.now();
+  const pools = await Promise.all(
+    Array.from({ length: poolCount }, (_, index) =>
+      getBrowserPoolHealth(env, index)
+    )
+  );
+  const summary = summarizePoolHealth(pools);
+
+  return json({
+    version: VERSION,
+    success: true,
+    service: "siona-web-scraper",
+    architecture: "hybrid-fetch-browser",
+    browserPool: {
+      configured: true,
+      ...summary,
+      maxTabs: Math.max(1, Number(env.TABS_PER_POOL || 5)),
+      routing: String(env.POOL_ROUTING || "deterministic"),
+      durationMs: Date.now() - startedAt,
+      pools
+    }
+  });
 }
 
 async function selectBrowserPoolIndex(url, env) {
@@ -2803,6 +2893,13 @@ export default {
       pathname === "/health"
     ) {
       return healthResponse();
+    }
+
+    if (
+      request.method === "GET" &&
+      pathname === "/health/detailed"
+    ) {
+      return handleDetailedHealth(env);
     }
 
     if (

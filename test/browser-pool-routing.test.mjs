@@ -3,7 +3,8 @@ import fs from "node:fs";
 import assert from "node:assert/strict";
 import {
   getBrowserPoolCandidates,
-  getBrowserPoolIndex
+  getBrowserPoolIndex,
+  summarizePoolHealth
 } from "../src/index.js";
 
 test("browser pool routing is deterministic and bounded", () => {
@@ -42,4 +43,21 @@ test("browser pool routing includes load-aware status fallback", () => {
   assert.match(source, /browser-pool\/status/);
   assert.match(source, /return fallback/);
   assert.match(wrangler, /"POOL_ROUTING": "power-of-two"/);
+});
+
+test("browser pool health summary aggregates readiness and load", () => {
+  assert.deepEqual(
+    summarizePoolHealth([
+      { ready: true, activeTabs: 2, waiting: 1 },
+      { ready: false, activeTabs: 0, waiting: 3 },
+      { ready: true, activeTabs: 1, waiting: 0 }
+    ]),
+    {
+      poolCount: 3,
+      readyPools: 2,
+      activeTabs: 3,
+      waiting: 4,
+      healthy: false
+    }
+  );
 });
