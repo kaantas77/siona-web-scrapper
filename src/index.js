@@ -1,10 +1,15 @@
 import puppeteer from "@cloudflare/puppeteer";
 
-const VERSION = "siona-hybrid-v8";
+const VERSION = "siona-hybrid-v9";
 
 const MAX_TEXT_LENGTH = 50_000;
-const MAX_BATCH_SIZE = 5;
+
+const MAX_LEGACY_BATCH_SIZE = 5;
+const MAX_SYNC_BATCH_SIZE = 20;
 const MAX_JOB_SIZE = 100;
+
+const FETCH_CONCURRENCY = 6;
+const BROWSER_PAGE_CONCURRENCY = 3;
 
 const FETCH_TIMEOUT_MS = 15_000;
 const BROWSER_TIMEOUT_MS = 30_000;
@@ -30,7 +35,9 @@ function json(data, status = 200) {
 }
 
 function getErrorMessage(error) {
-  return error instanceof Error ? error.message : String(error);
+  return error instanceof Error
+    ? error.message
+    : String(error);
 }
 
 function nowIso() {
@@ -38,11 +45,65 @@ function nowIso() {
 }
 
 /* -------------------------------------------------------------------------- */
+/*                               CONCURRENCY                                  */
+/* -------------------------------------------------------------------------- */
+
+async function mapWithConcurrency(
+  items,
+  concurrency,
+  handler
+) {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+
+      if (currentIndex >= items.length) {
+        return;
+      }
+
+      try {
+        results[currentIndex] = await handler(
+          items[currentIndex],
+          currentIndex
+        );
+      } catch (error) {
+        results[currentIndex] = {
+          success: false,
+          error: getErrorMessage(error)
+        };
+      }
+    }
+  }
+
+  const workerCount = Math.min(
+    Math.max(1, concurrency),
+    items.length
+  );
+
+  await Promise.all(
+    Array.from(
+      { length: workerCount },
+      () => worker()
+    )
+  );
+
+  return results;
+}
+
+/* -------------------------------------------------------------------------- */
 /*                               TEXT CLEANING                                */
 /* -------------------------------------------------------------------------- */
 
 function decodeHtmlEntities(text) {
-  return text
+  return String(text || "")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
@@ -60,7 +121,9 @@ function decodeHtmlEntities(text) {
     })
     .replace(/&#x([0-9a-f]+);/gi, (match, code) => {
       try {
-        return String.fromCodePoint(parseInt(code, 16));
+        return String.fromCodePoint(
+          parseInt(code, 16)
+        );
       } catch {
         return match;
       }
@@ -93,7 +156,7 @@ function fixMojibake(text) {
     ["Â", ""]
   ];
 
-  let result = text;
+  let result = String(text || "");
 
   for (let pass = 0; pass < 2; pass += 1) {
     for (const [broken, correct] of replacements) {
@@ -106,7 +169,7 @@ function fixMojibake(text) {
 
 function normalizeText(text) {
   return fixMojibake(
-    decodeHtmlEntities(String(text || ""))
+    decodeHtmlEntities(text)
       .replace(/\u00a0/g, " ")
       .replace(/\s+/g, " ")
       .trim()
@@ -115,18 +178,35 @@ function normalizeText(text) {
 
 function cleanHtml(html) {
   const rawTitle =
-    html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
+    html.match(
+      /<title[^>]*>([\s\S]*?)<\/title>/i
+    )?.[1] || "";
 
   const title = normalizeText(
     rawTitle.replace(/<[^>]+>/g, " ")
   );
 
   const rawText = html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, " ")
-    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, " ")
-    .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, " ")
+    .replace(
+      /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+      " "
+    )
+    .replace(
+      /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+      " "
+    )
+    .replace(
+      /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
+      " "
+    )
+    .replace(
+      /<svg\b[^>]*>[\s\S]*?<\/svg>/gi,
+      " "
+    )
+    .replace(
+      /<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi,
+      " "
+    )
     .replace(/<!--[\s\S]*?-->/g, " ")
     .replace(
       /<\/(p|div|article|section|main|header|footer|li|h1|h2|h3|h4|h5|h6|br)>/gi,
@@ -142,7 +222,10 @@ function cleanHtml(html) {
 
 function mojibakeScore(text) {
   const matches = text.match(/[ÃÄÅÂâ€]/g);
-  return matches ? matches.length : 0;
+
+  return matches
+    ? matches.length
+    : 0;
 }
 
 function decodeBuffer(buffer, encoding) {
@@ -158,13 +241,24 @@ function decodeBuffer(buffer, encoding) {
 async function decodeResponse(response) {
   const buffer = await response.arrayBuffer();
 
-  const utf8Text = decodeBuffer(buffer, "utf-8");
-  const windowsText = decodeBuffer(buffer, "windows-1252");
+  const utf8Text = decodeBuffer(
+    buffer,
+    "utf-8"
+  );
+
+  const windowsText = decodeBuffer(
+    buffer,
+    "windows-1252"
+  );
 
   const utf8Score = mojibakeScore(utf8Text);
-  const windowsScore = mojibakeScore(windowsText);
+  const windowsScore =
+    mojibakeScore(windowsText);
 
-  if (utf8Text && utf8Score <= windowsScore) {
+  if (
+    utf8Text &&
+    utf8Score <= windowsScore
+  ) {
     return utf8Text;
   }
 
@@ -195,12 +289,17 @@ function isPrivateOrLocalHostname(hostname) {
     return true;
   }
 
-  const match172 = value.match(/^172\.(\d+)\./);
+  const match172 =
+    value.match(/^172\.(\d+)\./);
 
   if (match172) {
-    const secondOctet = Number(match172[1]);
+    const secondOctet =
+      Number(match172[1]);
 
-    if (secondOctet >= 16 && secondOctet <= 31) {
+    if (
+      secondOctet >= 16 &&
+      secondOctet <= 31
+    ) {
       return true;
     }
   }
@@ -227,29 +326,47 @@ function parseAndValidateUrl(input) {
     parsedUrl.protocol !== "http:" &&
     parsedUrl.protocol !== "https:"
   ) {
-    throw new Error("Yalnızca HTTP ve HTTPS destekleniyor");
+    throw new Error(
+      "Yalnızca HTTP ve HTTPS destekleniyor"
+    );
   }
 
-  if (isPrivateOrLocalHostname(parsedUrl.hostname)) {
-    throw new Error("Yerel veya özel ağ adreslerine erişim yasak");
+  if (
+    isPrivateOrLocalHostname(
+      parsedUrl.hostname
+    )
+  ) {
+    throw new Error(
+      "Yerel veya özel ağ adreslerine erişim yasak"
+    );
   }
 
   return parsedUrl;
 }
 
 function normalizeUrl(input) {
-  return parseAndValidateUrl(input).toString();
+  return parseAndValidateUrl(
+    input
+  ).toString();
 }
 
-function normalizeUrlArray(input, maximum) {
+function normalizeUrlArray(
+  input,
+  maximum
+) {
   if (!Array.isArray(input)) {
-    throw new Error('"urls" bir dizi olmalı');
+    throw new Error(
+      '"urls" bir dizi olmalı'
+    );
   }
 
   const urls = [
     ...new Set(
       input
-        .filter((url) => typeof url === "string")
+        .filter(
+          (url) =>
+            typeof url === "string"
+        )
         .map((url) => url.trim())
         .filter(Boolean)
         .map(normalizeUrl)
@@ -257,7 +374,9 @@ function normalizeUrlArray(input, maximum) {
   ];
 
   if (urls.length === 0) {
-    throw new Error("En az bir URL gerekli");
+    throw new Error(
+      "En az bir URL gerekli"
+    );
   }
 
   if (urls.length > maximum) {
@@ -270,7 +389,7 @@ function normalizeUrlArray(input, maximum) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                            SCRAPE CLASSIFICATION                           */
+/*                            PAGE CLASSIFICATION                             */
 /* -------------------------------------------------------------------------- */
 
 function isFlashscoreMatchPage(url) {
@@ -278,7 +397,9 @@ function isFlashscoreMatchPage(url) {
     const parsedUrl = new URL(url);
 
     return (
-      parsedUrl.hostname.includes("flashscore.") &&
+      parsedUrl.hostname.includes(
+        "flashscore."
+      ) &&
       parsedUrl.pathname.includes("/mac/")
     );
   } catch {
@@ -286,34 +407,79 @@ function isFlashscoreMatchPage(url) {
   }
 }
 
-function needsBrowser(status, html, text) {
-  if (status >= 400) return true;
-  if (!html || html.length < 500) return true;
-  if (!text || text.length < 80) return true;
+function needsBrowser(
+  status,
+  html,
+  text
+) {
+  if (status >= 400) {
+    return true;
+  }
 
-  const lowerHtml = html.toLowerCase();
+  if (!html || html.length < 500) {
+    return true;
+  }
+
+  if (!text || text.length < 80) {
+    return true;
+  }
+
+  const lowerHtml =
+    html.toLowerCase();
 
   return (
-    lowerHtml.includes("enable javascript") ||
-    lowerHtml.includes("javascript is required") ||
-    lowerHtml.includes("checking your browser") ||
-    lowerHtml.includes("just a moment") ||
+    lowerHtml.includes(
+      "enable javascript"
+    ) ||
+    lowerHtml.includes(
+      "javascript is required"
+    ) ||
+    lowerHtml.includes(
+      "checking your browser"
+    ) ||
+    lowerHtml.includes(
+      "just a moment"
+    ) ||
     lowerHtml.includes("cf-chl-") ||
-    lowerHtml.includes("loading...") ||
-    lowerHtml.includes("verify you are human") ||
-    (lowerHtml.includes("__next_data__") && text.length < 800)
+    lowerHtml.includes(
+      "loading..."
+    ) ||
+    lowerHtml.includes(
+      "verify you are human"
+    ) ||
+    (
+      lowerHtml.includes(
+        "__next_data__"
+      ) &&
+      text.length < 800
+    )
   );
 }
 
-function detectBlockedText(title, text) {
-  const content = `${title || ""} ${text || ""}`.toLowerCase();
+function detectBlockedText(
+  title,
+  text
+) {
+  const content =
+    `${title || ""} ${text || ""}`
+      .toLowerCase();
 
   return (
-    content.includes("just a moment") ||
-    content.includes("checking your browser") ||
-    content.includes("verify you are human") ||
-    content.includes("access denied") ||
-    content.includes("unusual traffic") ||
+    content.includes(
+      "just a moment"
+    ) ||
+    content.includes(
+      "checking your browser"
+    ) ||
+    content.includes(
+      "verify you are human"
+    ) ||
+    content.includes(
+      "access denied"
+    ) ||
+    content.includes(
+      "unusual traffic"
+    ) ||
     content.includes("cf-chl-")
   );
 }
@@ -322,9 +488,18 @@ function detectBlockedText(title, text) {
 /*                                 FAST FETCH                                 */
 /* -------------------------------------------------------------------------- */
 
-async function fetchWithTimeout(url, options, timeoutMs) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+async function fetchWithTimeout(
+  url,
+  options,
+  timeoutMs
+) {
+  const controller =
+    new AbortController();
+
+  const timeout = setTimeout(
+    () => controller.abort(),
+    timeoutMs
+  );
 
   try {
     return await fetch(url, {
@@ -340,46 +515,65 @@ async function tryFastFetch(url) {
   if (isFlashscoreMatchPage(url)) {
     return {
       requiresBrowser: true,
-      reason: "Flashscore maç sayfası browser ile açılmalı"
+      reason:
+        "Flashscore maç sayfası browser ile açılmalı"
     };
   }
 
   try {
-    const response = await fetchWithTimeout(
-      url,
-      {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (compatible; SionaBot/1.0; +https://aisiona.com)",
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language":
-            "tr-TR,tr;q=0.9,en;q=0.8"
+    const response =
+      await fetchWithTimeout(
+        url,
+        {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (compatible; SionaBot/1.0; +https://aisiona.com)",
+            Accept:
+              "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language":
+              "tr-TR,tr;q=0.9,en;q=0.8"
+          },
+          redirect: "follow"
         },
-        redirect: "follow"
-      },
-      FETCH_TIMEOUT_MS
-    );
+        FETCH_TIMEOUT_MS
+      );
 
     const contentType =
-      response.headers.get("content-type") || "";
+      response.headers.get(
+        "content-type"
+      ) || "";
 
-    if (!contentType.toLowerCase().includes("text/html")) {
+    if (
+      !contentType
+        .toLowerCase()
+        .includes("text/html")
+    ) {
       return {
         requiresBrowser: true,
-        reason: `HTML olmayan içerik: ${
-          contentType || "bilinmiyor"
-        }`
+        reason:
+          `HTML olmayan içerik: ${
+            contentType || "bilinmiyor"
+          }`
       };
     }
 
-    const html = await decodeResponse(response);
-    const cleaned = cleanHtml(html);
+    const html =
+      await decodeResponse(response);
 
-    if (needsBrowser(response.status, html, cleaned.text)) {
+    const cleaned =
+      cleanHtml(html);
+
+    if (
+      needsBrowser(
+        response.status,
+        html,
+        cleaned.text
+      )
+    ) {
       return {
         requiresBrowser: true,
-        reason: "Sayfa JavaScript veya browser gerektiriyor"
+        reason:
+          "Sayfa JavaScript veya browser gerektiriyor"
       };
     }
 
@@ -391,15 +585,20 @@ async function tryFastFetch(url) {
         status: response.status,
         finalUrl: response.url,
         title: cleaned.title,
-        textLength: cleaned.text.length,
+        textLength:
+          cleaned.text.length,
         blocked: false,
-        text: cleaned.text.slice(0, MAX_TEXT_LENGTH)
+        text: cleaned.text.slice(
+          0,
+          MAX_TEXT_LENGTH
+        )
       }
     };
   } catch (error) {
     return {
       requiresBrowser: true,
-      reason: getErrorMessage(error)
+      reason:
+        getErrorMessage(error)
     };
   }
 }
@@ -416,7 +615,8 @@ async function configurePage(page) {
   );
 
   await page.setExtraHTTPHeaders({
-    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8"
+    "Accept-Language":
+      "tr-TR,tr;q=0.9,en;q=0.8"
   });
 
   await page.setViewport({
@@ -425,15 +625,21 @@ async function configurePage(page) {
   });
 }
 
-async function waitForRenderedPage(page, url) {
+async function waitForRenderedPage(
+  page,
+  url
+) {
   if (isFlashscoreMatchPage(url)) {
     try {
       await page.waitForFunction(
         () => {
-          const bodyText = document.body?.innerText || "";
+          const bodyText =
+            document.body?.innerText || "";
 
           return (
-            !bodyText.includes("Loading...") &&
+            !bodyText.includes(
+              "Loading..."
+            ) &&
             bodyText.length > 1000
           );
         },
@@ -442,8 +648,9 @@ async function waitForRenderedPage(page, url) {
         }
       );
     } catch {
-      await new Promise((resolve) =>
-        setTimeout(resolve, 5_000)
+      await new Promise(
+        (resolve) =>
+          setTimeout(resolve, 5_000)
       );
     }
 
@@ -456,47 +663,66 @@ async function waitForRenderedPage(page, url) {
       timeout: 10_000
     });
   } catch {
-    await new Promise((resolve) =>
-      setTimeout(resolve, 1_500)
+    await new Promise(
+      (resolve) =>
+        setTimeout(resolve, 1_500)
     );
   }
 }
 
-async function scrapePageWithBrowser(browser, url) {
-  const page = await browser.newPage();
+async function scrapePageWithBrowser(
+  browser,
+  url
+) {
+  const page =
+    await browser.newPage();
 
   try {
     await configurePage(page);
 
-    const response = await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: BROWSER_TIMEOUT_MS
-    });
+    const response =
+      await page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout:
+          BROWSER_TIMEOUT_MS
+      });
 
-    await waitForRenderedPage(page, url);
+    await waitForRenderedPage(
+      page,
+      url
+    );
 
-    const result = await page.evaluate(() => {
-      const title = document.title || "";
+    const result =
+      await page.evaluate(() => {
+        const title =
+          document.title || "";
 
-      const text =
-        document.body?.innerText
-          ?.replace(/\s+/g, " ")
-          .trim() || "";
+        const text =
+          document.body?.innerText
+            ?.replace(/\s+/g, " ")
+            .trim() || "";
 
-      return {
-        title,
-        text
-      };
-    });
+        return {
+          title,
+          text
+        };
+      });
 
-    const title = normalizeText(result.title);
-    const text = normalizeText(result.text);
+    const title =
+      normalizeText(result.title);
+
+    const text =
+      normalizeText(result.text);
 
     const stillLoading =
       text.includes("Loading...") ||
       text.length < 80;
 
-    const blocked = detectBlockedText(title, text);
+    const blocked =
+      detectBlockedText(
+        title,
+        text
+      );
 
     return {
       success:
@@ -504,28 +730,46 @@ async function scrapePageWithBrowser(browser, url) {
         !blocked &&
         text.length > 80,
       method: "browser",
-      status: response?.status() || 200,
+      status:
+        response?.status() || 200,
       finalUrl: page.url(),
       title,
       textLength: text.length,
       stillLoading,
       blocked,
-      text: text.slice(0, MAX_TEXT_LENGTH)
+      text: text.slice(
+        0,
+        MAX_TEXT_LENGTH
+      )
     };
   } finally {
-    await page.close().catch(() => {});
+    await page
+      .close()
+      .catch(() => {});
   }
 }
 
-async function scrapeWithNewBrowser(url, env) {
+async function scrapeWithNewBrowser(
+  url,
+  env
+) {
   let browser;
 
   try {
-    browser = await puppeteer.launch(env.BROWSER);
-    return await scrapePageWithBrowser(browser, url);
+    browser =
+      await puppeteer.launch(
+        env.BROWSER
+      );
+
+    return await scrapePageWithBrowser(
+      browser,
+      url
+    );
   } finally {
     if (browser) {
-      await browser.close().catch(() => {});
+      await browser
+        .close()
+        .catch(() => {});
     }
   }
 }
@@ -534,30 +778,42 @@ async function scrapeWithNewBrowser(url, env) {
 /*                            SINGLE URL SCRAPING                             */
 /* -------------------------------------------------------------------------- */
 
-async function scrapeSingleUrl(url, env) {
-  const normalizedUrl = normalizeUrl(url);
+async function scrapeSingleUrl(
+  url,
+  env
+) {
+  const normalizedUrl =
+    normalizeUrl(url);
+
   const startedAt = Date.now();
 
-  const fastResult = await tryFastFetch(normalizedUrl);
+  const fastResult =
+    await tryFastFetch(
+      normalizedUrl
+    );
 
   if (!fastResult.requiresBrowser) {
     return {
       requestedUrl: normalizedUrl,
-      durationMs: Date.now() - startedAt,
+      durationMs:
+        Date.now() - startedAt,
       ...fastResult.result
     };
   }
 
   try {
-    const browserResult = await scrapeWithNewBrowser(
-      normalizedUrl,
-      env
-    );
+    const browserResult =
+      await scrapeWithNewBrowser(
+        normalizedUrl,
+        env
+      );
 
     return {
       requestedUrl: normalizedUrl,
-      fallbackReason: fastResult.reason,
-      durationMs: Date.now() - startedAt,
+      fallbackReason:
+        fastResult.reason,
+      durationMs:
+        Date.now() - startedAt,
       ...browserResult
     };
   } catch (error) {
@@ -565,19 +821,257 @@ async function scrapeSingleUrl(url, env) {
       requestedUrl: normalizedUrl,
       success: false,
       method: "browser",
-      durationMs: Date.now() - startedAt,
-      error: getErrorMessage(error),
-      fallbackReason: fastResult.reason
+      durationMs:
+        Date.now() - startedAt,
+      error:
+        getErrorMessage(error),
+      fallbackReason:
+        fastResult.reason
     };
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                        SYNCHRONOUS MULTI SCRAPE                            */
+/* -------------------------------------------------------------------------- */
+
+function buildSynchronousResponse(
+  urls,
+  results,
+  startedAt
+) {
+  const successful =
+    results.filter(
+      (result) => result?.success
+    ).length;
+
+  const browserCount =
+    results.filter(
+      (result) =>
+        result?.method === "browser"
+    ).length;
+
+  const fetchCount =
+    results.filter(
+      (result) =>
+        result?.method === "fetch"
+    ).length;
+
+  return {
+    version: VERSION,
+    success: successful > 0,
+    mode: "synchronous",
+    requested: urls.length,
+    successful,
+    failed:
+      urls.length - successful,
+    fetchCount,
+    browserCount,
+    durationMs:
+      Date.now() - startedAt,
+    results
+  };
+}
+
+async function scrapeManySynchronously(
+  urls,
+  env
+) {
+  const startedAt = Date.now();
+
+  const classifications =
+    await mapWithConcurrency(
+      urls,
+      FETCH_CONCURRENCY,
+      async (url) => {
+        const itemStartedAt =
+          Date.now();
+
+        try {
+          const fastResult =
+            await tryFastFetch(url);
+
+          return {
+            url,
+            itemStartedAt,
+            fastResult
+          };
+        } catch (error) {
+          return {
+            url,
+            itemStartedAt,
+            fastResult: {
+              requiresBrowser: true,
+              reason:
+                getErrorMessage(error)
+            }
+          };
+        }
+      }
+    );
+
+  const results =
+    new Array(urls.length);
+
+  const browserItems = [];
+
+  for (
+    let index = 0;
+    index <
+    classifications.length;
+    index += 1
+  ) {
+    const classification =
+      classifications[index];
+
+    const {
+      url,
+      itemStartedAt,
+      fastResult
+    } = classification;
+
+    if (
+      !fastResult.requiresBrowser
+    ) {
+      results[index] = {
+        requestedUrl: url,
+        durationMs:
+          Date.now() -
+          itemStartedAt,
+        fallbackReason: null,
+        ...fastResult.result
+      };
+
+      continue;
+    }
+
+    browserItems.push({
+      index,
+      url,
+      itemStartedAt,
+      fallbackReason:
+        fastResult.reason
+    });
+  }
+
+  if (
+    browserItems.length === 0
+  ) {
+    return buildSynchronousResponse(
+      urls,
+      results,
+      startedAt
+    );
+  }
+
+  let browser;
+
+  try {
+    browser =
+      await puppeteer.launch(
+        env.BROWSER
+      );
+
+    const browserResults =
+      await mapWithConcurrency(
+        browserItems,
+        BROWSER_PAGE_CONCURRENCY,
+        async (item) => {
+          try {
+            const browserResult =
+              await scrapePageWithBrowser(
+                browser,
+                item.url
+              );
+
+            return {
+              index: item.index,
+              result: {
+                requestedUrl:
+                  item.url,
+                fallbackReason:
+                  item.fallbackReason,
+                durationMs:
+                  Date.now() -
+                  item.itemStartedAt,
+                ...browserResult
+              }
+            };
+          } catch (error) {
+            return {
+              index: item.index,
+              result: {
+                requestedUrl:
+                  item.url,
+                success: false,
+                method: "browser",
+                fallbackReason:
+                  item.fallbackReason,
+                durationMs:
+                  Date.now() -
+                  item.itemStartedAt,
+                error:
+                  getErrorMessage(error)
+              }
+            };
+          }
+        }
+      );
+
+    for (
+      const browserResult
+      of browserResults
+    ) {
+      results[
+        browserResult.index
+      ] = browserResult.result;
+    }
+  } catch (error) {
+    const errorMessage =
+      getErrorMessage(error);
+
+    for (
+      const item
+      of browserItems
+    ) {
+      results[item.index] = {
+        requestedUrl: item.url,
+        success: false,
+        method: "browser",
+        fallbackReason:
+          item.fallbackReason,
+        durationMs:
+          Date.now() -
+          item.itemStartedAt,
+        error: errorMessage
+      };
+    }
+  } finally {
+    if (browser) {
+      await browser
+        .close()
+        .catch(() => {});
+    }
+  }
+
+  return buildSynchronousResponse(
+    urls,
+    results,
+    startedAt
+  );
 }
 
 /* -------------------------------------------------------------------------- */
 /*                              D1 JOB HELPERS                                */
 /* -------------------------------------------------------------------------- */
 
-async function createJob(env, urls) {
-  const jobId = `job_${crypto.randomUUID()}`;
+async function createJob(
+  env,
+  urls
+) {
+  const jobId =
+    `job_${crypto.randomUUID()}`;
+
   const createdAt = nowIso();
 
   const statements = [
@@ -593,7 +1087,16 @@ async function createJob(env, urls) {
           created_at,
           updated_at
         )
-        VALUES (?, 'queued', ?, 0, 0, 0, ?, ?)
+        VALUES (
+          ?,
+          'queued',
+          ?,
+          0,
+          0,
+          0,
+          ?,
+          ?
+        )
       `
     ).bind(
       jobId,
@@ -603,41 +1106,54 @@ async function createJob(env, urls) {
     )
   ];
 
-  const items = urls.map((url, index) => {
-    const itemId =
-      `item_${String(index + 1).padStart(3, "0")}_` +
-      crypto.randomUUID();
+  const items = urls.map(
+    (url, index) => {
+      const itemId =
+        `item_${String(
+          index + 1
+        ).padStart(3, "0")}_` +
+        crypto.randomUUID();
 
-    statements.push(
-      env.DB.prepare(
-        `
-          INSERT INTO job_items (
-            id,
-            job_id,
-            url,
-            status,
-            created_at,
-            updated_at
-          )
-          VALUES (?, ?, ?, 'queued', ?, ?)
-        `
-      ).bind(
+      statements.push(
+        env.DB.prepare(
+          `
+            INSERT INTO job_items (
+              id,
+              job_id,
+              url,
+              status,
+              created_at,
+              updated_at
+            )
+            VALUES (
+              ?,
+              ?,
+              ?,
+              'queued',
+              ?,
+              ?
+            )
+          `
+        ).bind(
+          itemId,
+          jobId,
+          url,
+          createdAt,
+          createdAt
+        )
+      );
+
+      return {
         itemId,
         jobId,
-        url,
-        createdAt,
-        createdAt
-      )
-    );
+        url
+      };
+    }
+  );
 
-    return {
-      itemId,
-      jobId,
-      url
-    };
-  });
-
-  await env.DB.batch(statements);
+  await env.DB.batch(
+    statements
+  );
 
   return {
     jobId,
@@ -645,7 +1161,10 @@ async function createJob(env, urls) {
   };
 }
 
-async function getJob(env, jobId) {
+async function getJob(
+  env,
+  jobId
+) {
   return env.DB.prepare(
     `
       SELECT
@@ -665,7 +1184,10 @@ async function getJob(env, jobId) {
     .first();
 }
 
-async function getJobItem(env, itemId) {
+async function getJobItem(
+  env,
+  itemId
+) {
   return env.DB.prepare(
     `
       SELECT
@@ -689,7 +1211,10 @@ async function getJobItem(env, itemId) {
     .first();
 }
 
-async function markItemProcessing(env, itemId) {
+async function markItemProcessing(
+  env,
+  itemId
+) {
   await env.DB.prepare(
     `
       UPDATE job_items
@@ -700,7 +1225,10 @@ async function markItemProcessing(env, itemId) {
       WHERE id = ?
     `
   )
-    .bind(nowIso(), itemId)
+    .bind(
+      nowIso(),
+      itemId
+    )
     .run();
 }
 
@@ -710,9 +1238,10 @@ async function saveItemResult(
   itemId,
   result
 ) {
-  const itemStatus = result.success
-    ? "completed"
-    : "failed";
+  const itemStatus =
+    result.success
+      ? "completed"
+      : "failed";
 
   await env.DB.prepare(
     `
@@ -727,7 +1256,9 @@ async function saveItemResult(
         error = ?,
         duration_ms = ?,
         updated_at = ?
-      WHERE id = ? AND job_id = ?
+      WHERE
+        id = ?
+        AND job_id = ?
     `
   )
     .bind(
@@ -745,7 +1276,10 @@ async function saveItemResult(
     )
     .run();
 
-  await refreshJobStatus(env, jobId);
+  await refreshJobStatus(
+    env,
+    jobId
+  );
 }
 
 async function markItemForRetry(
@@ -784,7 +1318,9 @@ async function markItemPermanentlyFailed(
         status = 'failed',
         error = ?,
         updated_at = ?
-      WHERE id = ? AND job_id = ?
+      WHERE
+        id = ?
+        AND job_id = ?
     `
   )
     .bind(
@@ -795,47 +1331,81 @@ async function markItemPermanentlyFailed(
     )
     .run();
 
-  await refreshJobStatus(env, jobId);
+  await refreshJobStatus(
+    env,
+    jobId
+  );
 }
 
-async function refreshJobStatus(env, jobId) {
-  const counts = await env.DB.prepare(
-    `
-      SELECT
-        COUNT(*) AS total,
-        SUM(
-          CASE WHEN status = 'completed'
-          THEN 1 ELSE 0 END
-        ) AS successful,
-        SUM(
-          CASE WHEN status = 'failed'
-          THEN 1 ELSE 0 END
-        ) AS failed,
-        SUM(
-          CASE
-            WHEN status IN ('completed', 'failed')
-            THEN 1 ELSE 0
-          END
-        ) AS completed
-      FROM job_items
-      WHERE job_id = ?
-    `
-  )
-    .bind(jobId)
-    .first();
+async function refreshJobStatus(
+  env,
+  jobId
+) {
+  const counts =
+    await env.DB.prepare(
+      `
+        SELECT
+          COUNT(*) AS total,
+          SUM(
+            CASE
+              WHEN status = 'completed'
+              THEN 1
+              ELSE 0
+            END
+          ) AS successful,
+          SUM(
+            CASE
+              WHEN status = 'failed'
+              THEN 1
+              ELSE 0
+            END
+          ) AS failed,
+          SUM(
+            CASE
+              WHEN status IN (
+                'completed',
+                'failed'
+              )
+              THEN 1
+              ELSE 0
+            END
+          ) AS completed
+        FROM job_items
+        WHERE job_id = ?
+      `
+    )
+      .bind(jobId)
+      .first();
 
-  const total = Number(counts?.total || 0);
-  const successful = Number(counts?.successful || 0);
-  const failed = Number(counts?.failed || 0);
-  const completed = Number(counts?.completed || 0);
+  const total =
+    Number(counts?.total || 0);
+
+  const successful =
+    Number(
+      counts?.successful || 0
+    );
+
+  const failed =
+    Number(counts?.failed || 0);
+
+  const completed =
+    Number(
+      counts?.completed || 0
+    );
 
   let status = "processing";
 
-  if (completed >= total && total > 0) {
-    status = failed > 0
-      ? "completed_with_errors"
-      : "completed";
-  } else if (completed === 0) {
+  if (
+    completed >= total &&
+    total > 0
+  ) {
+    status =
+      failed > 0
+        ? "completed_with_errors"
+        : "completed";
+  } else if (
+    completed === 0
+  ) {
     status = "queued";
   }
 
@@ -898,25 +1468,47 @@ async function markJobEnqueueFailed(
           updated_at = ?
         WHERE id = ?
       `
-    ).bind(updatedAt, jobId)
+    ).bind(
+      updatedAt,
+      jobId
+    )
   ]);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              REQUEST HELPERS                               */
+/* -------------------------------------------------------------------------- */
+
+async function readJsonBody(request) {
+  try {
+    return await request.json();
+  } catch {
+    throw new Error(
+      "Geçerli JSON gövdesi gerekli"
+    );
+  }
 }
 
 /* -------------------------------------------------------------------------- */
 /*                              JOB ENDPOINTS                                 */
 /* -------------------------------------------------------------------------- */
 
-async function handleCreateJob(request, env) {
+async function handleCreateJob(
+  request,
+  env
+) {
   let body;
 
   try {
-    body = await request.json();
-  } catch {
+    body =
+      await readJsonBody(request);
+  } catch (error) {
     return json(
       {
         version: VERSION,
         success: false,
-        error: "Geçerli JSON gövdesi gerekli"
+        error:
+          getErrorMessage(error)
       },
       400
     );
@@ -934,7 +1526,8 @@ async function handleCreateJob(request, env) {
       {
         version: VERSION,
         success: false,
-        error: getErrorMessage(error)
+        error:
+          getErrorMessage(error)
       },
       400
     );
@@ -943,15 +1536,20 @@ async function handleCreateJob(request, env) {
   let createdJob;
 
   try {
-    createdJob = await createJob(env, urls);
+    createdJob =
+      await createJob(
+        env,
+        urls
+      );
   } catch (error) {
     return json(
       {
         version: VERSION,
         success: false,
-        error: `D1 job oluşturulamadı: ${getErrorMessage(
-          error
-        )}`
+        error:
+          `D1 job oluşturulamadı: ${getErrorMessage(
+            error
+          )}`
       },
       500
     );
@@ -959,17 +1557,20 @@ async function handleCreateJob(request, env) {
 
   try {
     await env.SCRAPE_QUEUE.sendBatch(
-      createdJob.items.map((item) => ({
-        body: {
-          type: "scrape_url",
-          jobId: item.jobId,
-          itemId: item.itemId,
-          url: item.url
-        }
-      }))
+      createdJob.items.map(
+        (item) => ({
+          body: {
+            type: "scrape_url",
+            jobId: item.jobId,
+            itemId: item.itemId,
+            url: item.url
+          }
+        })
+      )
     );
   } catch (error) {
-    const message = getErrorMessage(error);
+    const message =
+      getErrorMessage(error);
 
     await markJobEnqueueFailed(
       env,
@@ -981,8 +1582,10 @@ async function handleCreateJob(request, env) {
       {
         version: VERSION,
         success: false,
-        jobId: createdJob.jobId,
-        error: `Queue gönderimi başarısız: ${message}`
+        jobId:
+          createdJob.jobId,
+        error:
+          `Queue gönderimi başarısız: ${message}`
       },
       500
     );
@@ -992,32 +1595,49 @@ async function handleCreateJob(request, env) {
     {
       version: VERSION,
       success: true,
-      jobId: createdJob.jobId,
+      mode: "asynchronous",
+      jobId:
+        createdJob.jobId,
       status: "queued",
       total: urls.length,
-      statusUrl: `/jobs/${createdJob.jobId}`,
-      resultsUrl: `/jobs/${createdJob.jobId}/results`
+      statusUrl:
+        `/jobs/${createdJob.jobId}`,
+      resultsUrl:
+        `/jobs/${createdJob.jobId}/results`
     },
     202
   );
 }
 
-async function handleGetJob(env, jobId) {
-  const job = await getJob(env, jobId);
+async function handleGetJob(
+  env,
+  jobId
+) {
+  const job =
+    await getJob(
+      env,
+      jobId
+    );
 
   if (!job) {
     return json(
       {
         version: VERSION,
         success: false,
-        error: "Job bulunamadı"
+        error:
+          "Job bulunamadı"
       },
       404
     );
   }
 
-  const total = Number(job.total || 0);
-  const completed = Number(job.completed || 0);
+  const total =
+    Number(job.total || 0);
+
+  const completed =
+    Number(
+      job.completed || 0
+    );
 
   return json({
     version: VERSION,
@@ -1026,12 +1646,27 @@ async function handleGetJob(env, jobId) {
       ...job,
       total,
       completed,
-      successful: Number(job.successful || 0),
-      failed: Number(job.failed || 0),
-      pending: Math.max(0, total - completed),
+      successful:
+        Number(
+          job.successful || 0
+        ),
+      failed:
+        Number(
+          job.failed || 0
+        ),
+      pending:
+        Math.max(
+          0,
+          total - completed
+        ),
       progress:
         total > 0
-          ? Math.round((completed / total) * 100)
+          ? Math.round(
+              (
+                completed /
+                total
+              ) * 100
+            )
           : 0
     }
   });
@@ -1042,43 +1677,77 @@ async function handleGetJobResults(
   env,
   jobId
 ) {
-  const job = await getJob(env, jobId);
+  const job =
+    await getJob(
+      env,
+      jobId
+    );
 
   if (!job) {
     return json(
       {
         version: VERSION,
         success: false,
-        error: "Job bulunamadı"
+        error:
+          "Job bulunamadı"
       },
       404
     );
   }
 
-  const requestUrl = new URL(request.url);
+  const requestUrl =
+    new URL(request.url);
 
-  const page = Math.max(
-    1,
-    Number(requestUrl.searchParams.get("page") || 1)
-  );
+  const parsedPage =
+    Number(
+      requestUrl.searchParams.get(
+        "page"
+      ) || 1
+    );
 
-  const limit = Math.min(
-    20,
-    Math.max(
-      1,
-      Number(requestUrl.searchParams.get("limit") || 10)
-    )
-  );
+  const parsedLimit =
+    Number(
+      requestUrl.searchParams.get(
+        "limit"
+      ) || 10
+    );
+
+  const page =
+    Number.isFinite(parsedPage)
+      ? Math.max(
+          1,
+          Math.floor(parsedPage)
+        )
+      : 1;
+
+  const limit =
+    Number.isFinite(parsedLimit)
+      ? Math.min(
+          20,
+          Math.max(
+            1,
+            Math.floor(
+              parsedLimit
+            )
+          )
+        )
+      : 10;
 
   const includeText =
-    requestUrl.searchParams.get("includeText") === "1" ||
-    requestUrl.searchParams.get("includeText") === "true";
+    requestUrl.searchParams.get(
+      "includeText"
+    ) === "1" ||
+    requestUrl.searchParams.get(
+      "includeText"
+    ) === "true";
 
-  const offset = (page - 1) * limit;
+  const offset =
+    (page - 1) * limit;
 
-  const selectText = includeText
-    ? ", text"
-    : "";
+  const selectText =
+    includeText
+      ? ", text"
+      : "";
 
   const query = `
     SELECT
@@ -1100,76 +1769,50 @@ async function handleGetJobResults(
     LIMIT ? OFFSET ?
   `;
 
-  const result = await env.DB.prepare(query)
-    .bind(jobId, limit, offset)
-    .all();
+  const result =
+    await env.DB.prepare(query)
+      .bind(
+        jobId,
+        limit,
+        offset
+      )
+      .all();
 
   return json({
     version: VERSION,
     success: true,
     jobId,
     status: job.status,
-    total: Number(job.total || 0),
+    total:
+      Number(job.total || 0),
     page,
     limit,
     includeText,
-    results: result.results || []
+    results:
+      result.results || []
   });
 }
 
 /* -------------------------------------------------------------------------- */
-/*                            LEGACY ENDPOINTS                                */
+/*                           SYNCHRONOUS ENDPOINT                             */
 /* -------------------------------------------------------------------------- */
 
-async function handleSingleRequest(request, env) {
-  const requestUrl = new URL(request.url);
-  const targetUrl = requestUrl.searchParams.get("url");
-
-  if (!targetUrl) {
-    return json(
-      {
-        version: VERSION,
-        success: false,
-        error: "URL gerekli",
-        example: "/?url=https://example.com"
-      },
-      400
-    );
-  }
+async function handleScrapeManyRequest(
+  request,
+  env
+) {
+  let body;
 
   try {
-    const result = await scrapeSingleUrl(
-      targetUrl,
-      env
-    );
-
-    return json({
-      version: VERSION,
-      ...result
-    });
+    body =
+      await readJsonBody(request);
   } catch (error) {
     return json(
       {
         version: VERSION,
         success: false,
-        error: getErrorMessage(error)
-      },
-      400
-    );
-  }
-}
-
-async function handleBatchRequest(request, env) {
-  let body;
-
-  try {
-    body = await request.json();
-  } catch {
-    return json(
-      {
-        version: VERSION,
-        success: false,
-        error: "Geçerli JSON gövdesi gerekli"
+        error:
+          getErrorMessage(error)
       },
       400
     );
@@ -1180,47 +1823,148 @@ async function handleBatchRequest(request, env) {
   try {
     urls = normalizeUrlArray(
       body.urls,
-      MAX_BATCH_SIZE
+      MAX_SYNC_BATCH_SIZE
     );
   } catch (error) {
     return json(
       {
         version: VERSION,
         success: false,
-        error: getErrorMessage(error)
+        error:
+          getErrorMessage(error),
+        synchronousLimit:
+          MAX_SYNC_BATCH_SIZE,
+        largeJobEndpoint:
+          "POST /jobs"
       },
       400
     );
   }
 
-  const startedAt = Date.now();
+  try {
+    const result =
+      await scrapeManySynchronously(
+        urls,
+        env
+      );
 
-  const results = await Promise.all(
-    urls.map(async (url) => {
-      try {
-        return await scrapeSingleUrl(url, env);
-      } catch (error) {
-        return {
-          requestedUrl: url,
-          success: false,
-          error: getErrorMessage(error)
-        };
-      }
-    })
-  );
+    return json(result);
+  } catch (error) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        mode: "synchronous",
+        error:
+          getErrorMessage(error)
+      },
+      500
+    );
+  }
+}
 
-  const successful = results.filter(
-    (result) => result.success
-  ).length;
+/* -------------------------------------------------------------------------- */
+/*                            LEGACY ENDPOINTS                                */
+/* -------------------------------------------------------------------------- */
+
+async function handleSingleRequest(
+  request,
+  env
+) {
+  const requestUrl =
+    new URL(request.url);
+
+  const targetUrl =
+    requestUrl.searchParams.get(
+      "url"
+    );
+
+  if (!targetUrl) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: "URL gerekli",
+        example:
+          "/?url=https://example.com"
+      },
+      400
+    );
+  }
+
+  try {
+    const result =
+      await scrapeSingleUrl(
+        targetUrl,
+        env
+      );
+
+    return json({
+      version: VERSION,
+      ...result
+    });
+  } catch (error) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error:
+          getErrorMessage(error)
+      },
+      400
+    );
+  }
+}
+
+async function handleBatchRequest(
+  request,
+  env
+) {
+  let body;
+
+  try {
+    body =
+      await readJsonBody(request);
+  } catch (error) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error:
+          getErrorMessage(error)
+      },
+      400
+    );
+  }
+
+  let urls;
+
+  try {
+    urls = normalizeUrlArray(
+      body.urls,
+      MAX_LEGACY_BATCH_SIZE
+    );
+  } catch (error) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error:
+          getErrorMessage(error)
+      },
+      400
+    );
+  }
+
+  const result =
+    await scrapeManySynchronously(
+      urls,
+      env
+    );
 
   return json({
-    version: VERSION,
-    success: successful > 0,
-    requested: urls.length,
-    successful,
-    failed: urls.length - successful,
-    durationMs: Date.now() - startedAt,
-    results
+    ...result,
+    mode: "legacy_batch"
   });
 }
 
@@ -1241,15 +1985,22 @@ async function processQueueMessageWithResult(
   );
 }
 
-async function processQueueBatch(batch, env) {
+async function processQueueBatch(
+  batch,
+  env
+) {
   const pendingMessages = [];
 
-  for (const message of batch.messages) {
+  for (
+    const message
+    of batch.messages
+  ) {
     const data = message.body;
 
     if (
       !data ||
-      data.type !== "scrape_url" ||
+      data.type !==
+        "scrape_url" ||
       !data.jobId ||
       !data.itemId ||
       !data.url
@@ -1258,10 +2009,11 @@ async function processQueueBatch(batch, env) {
       continue;
     }
 
-    const currentItem = await getJobItem(
-      env,
-      data.itemId
-    );
+    const currentItem =
+      await getJobItem(
+        env,
+        data.itemId
+      );
 
     if (!currentItem) {
       message.ack();
@@ -1269,14 +2021,19 @@ async function processQueueBatch(batch, env) {
     }
 
     if (
-      currentItem.status === "completed" ||
-      currentItem.status === "failed"
+      currentItem.status ===
+        "completed" ||
+      currentItem.status ===
+        "failed"
     ) {
       message.ack();
       continue;
     }
 
-    await markItemProcessing(env, data.itemId);
+    await markItemProcessing(
+      env,
+      data.itemId
+    );
 
     pendingMessages.push({
       message,
@@ -1285,52 +2042,64 @@ async function processQueueBatch(batch, env) {
     });
   }
 
-  if (pendingMessages.length === 0) {
+  if (
+    pendingMessages.length === 0
+  ) {
     return;
   }
 
-  /*
-   * Aynı Queue batch'indeki hızlı fetch işlemlerini paralel yapıyoruz.
-   * Wrangler max_batch_size değerimiz 5 olduğu için bir invocation
-   * içerisinde 5 fetch'i geçmiyoruz.
-   */
-  const fastResults = await Promise.all(
-    pendingMessages.map(async (entry) => {
-      try {
-        return {
-          entry,
-          fastResult: await tryFastFetch(entry.data.url)
-        };
-      } catch (error) {
-        return {
-          entry,
-          fastError: error
-        };
+  const fastResults =
+    await mapWithConcurrency(
+      pendingMessages,
+      FETCH_CONCURRENCY,
+      async (entry) => {
+        try {
+          return {
+            entry,
+            fastResult:
+              await tryFastFetch(
+                entry.data.url
+              )
+          };
+        } catch (error) {
+          return {
+            entry,
+            fastError: error
+          };
+        }
       }
-    })
-  );
+    );
 
   const browserEntries = [];
 
-  for (const item of fastResults) {
+  for (
+    const item
+    of fastResults
+  ) {
     const { entry } = item;
 
     if (item.fastError) {
       browserEntries.push({
         ...entry,
-        fallbackReason: getErrorMessage(
-          item.fastError
-        )
+        fallbackReason:
+          getErrorMessage(
+            item.fastError
+          )
       });
 
       continue;
     }
 
-    if (!item.fastResult.requiresBrowser) {
+    if (
+      !item.fastResult
+        .requiresBrowser
+    ) {
       const result = {
-        requestedUrl: entry.data.url,
+        requestedUrl:
+          entry.data.url,
         durationMs:
-          Date.now() - entry.startedAt,
+          Date.now() -
+          entry.startedAt,
         ...item.fastResult.result
       };
 
@@ -1346,85 +2115,83 @@ async function processQueueBatch(batch, env) {
 
     browserEntries.push({
       ...entry,
-      fallbackReason: item.fastResult.reason
+      fallbackReason:
+        item.fastResult.reason
     });
   }
 
-  if (browserEntries.length === 0) {
+  if (
+    browserEntries.length === 0
+  ) {
     return;
   }
 
   let browser;
 
   try {
-    /*
-     * Bir Queue batch'i için tek browser açıyoruz.
-     * Browser gereken URL'ler aynı browser oturumunda yeni sayfalarla
-     * sırayla işleniyor.
-     */
-    browser = await puppeteer.launch(env.BROWSER);
+    browser =
+      await puppeteer.launch(
+        env.BROWSER
+      );
 
-    for (const entry of browserEntries) {
-      try {
-        const browserResult =
-          await scrapePageWithBrowser(
-            browser,
-            entry.data.url
-          );
+    const browserResults =
+      await mapWithConcurrency(
+        browserEntries,
+        BROWSER_PAGE_CONCURRENCY,
+        async (entry) => {
+          try {
+            const browserResult =
+              await scrapePageWithBrowser(
+                browser,
+                entry.data.url
+              );
 
-        const result = {
-          requestedUrl: entry.data.url,
-          fallbackReason: entry.fallbackReason,
-          durationMs:
-            Date.now() - entry.startedAt,
-          ...browserResult
-        };
+            return {
+              entry,
+              success: true,
+              result: {
+                requestedUrl:
+                  entry.data.url,
+                fallbackReason:
+                  entry.fallbackReason,
+                durationMs:
+                  Date.now() -
+                  entry.startedAt,
+                ...browserResult
+              }
+            };
+          } catch (error) {
+            return {
+              entry,
+              success: false,
+              error:
+                getErrorMessage(error)
+            };
+          }
+        }
+      );
 
+    for (
+      const browserItem
+      of browserResults
+    ) {
+      const entry =
+        browserItem.entry;
+
+      if (browserItem.success) {
         await processQueueMessageWithResult(
           env,
           entry.data,
-          result
+          browserItem.result
         );
 
         entry.message.ack();
-      } catch (error) {
-        const errorMessage = getErrorMessage(error);
-
-        if (
-          entry.message.attempts >=
-          MAX_QUEUE_ATTEMPTS
-        ) {
-          await markItemPermanentlyFailed(
-            env,
-            entry.data.jobId,
-            entry.data.itemId,
-            errorMessage
-          );
-
-          entry.message.ack();
-        } else {
-          await markItemForRetry(
-            env,
-            entry.data.itemId,
-            errorMessage
-          );
-
-          entry.message.retry({
-            delaySeconds: Math.min(
-              30,
-              Math.max(
-                2,
-                2 ** entry.message.attempts
-              )
-            )
-          });
-        }
+        continue;
       }
-    }
-  } catch (error) {
-    const errorMessage = getErrorMessage(error);
 
-    for (const entry of browserEntries) {
+      const errorMessage =
+        browserItem.error;
+
       if (
         entry.message.attempts >=
         MAX_QUEUE_ATTEMPTS
@@ -1445,19 +2212,65 @@ async function processQueueBatch(batch, env) {
         );
 
         entry.message.retry({
-          delaySeconds: Math.min(
-            30,
-            Math.max(
-              2,
-              2 ** entry.message.attempts
+          delaySeconds:
+            Math.min(
+              30,
+              Math.max(
+                2,
+                2 **
+                  entry.message
+                    .attempts
+              )
             )
-          )
+        });
+      }
+    }
+  } catch (error) {
+    const errorMessage =
+      getErrorMessage(error);
+
+    for (
+      const entry
+      of browserEntries
+    ) {
+      if (
+        entry.message.attempts >=
+        MAX_QUEUE_ATTEMPTS
+      ) {
+        await markItemPermanentlyFailed(
+          env,
+          entry.data.jobId,
+          entry.data.itemId,
+          errorMessage
+        );
+
+        entry.message.ack();
+      } else {
+        await markItemForRetry(
+          env,
+          entry.data.itemId,
+          errorMessage
+        );
+
+        entry.message.retry({
+          delaySeconds:
+            Math.min(
+              30,
+              Math.max(
+                2,
+                2 **
+                  entry.message
+                    .attempts
+              )
+            )
         });
       }
     }
   } finally {
     if (browser) {
-      await browser.close().catch(() => {});
+      await browser
+        .close()
+        .catch(() => {});
     }
   }
 }
@@ -1468,33 +2281,54 @@ async function processQueueBatch(batch, env) {
 
 export default {
   async fetch(request, env) {
-    if (request.method === "OPTIONS") {
+    if (
+      request.method === "OPTIONS"
+    ) {
       return new Response(null, {
         status: 204,
         headers: {
-          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Origin":
+            "*",
           "Access-Control-Allow-Methods":
             "GET, POST, OPTIONS",
           "Access-Control-Allow-Headers":
             "Content-Type",
-          "Cache-Control": "no-store"
+          "Cache-Control":
+            "no-store"
         }
       });
     }
 
-    const requestUrl = new URL(request.url);
-    const pathname = requestUrl.pathname;
+    const requestUrl =
+      new URL(request.url);
+
+    const pathname =
+      requestUrl.pathname;
+
+    if (
+      request.method === "POST" &&
+      pathname === "/scrape-many"
+    ) {
+      return handleScrapeManyRequest(
+        request,
+        env
+      );
+    }
 
     if (
       request.method === "POST" &&
       pathname === "/jobs"
     ) {
-      return handleCreateJob(request, env);
+      return handleCreateJob(
+        request,
+        env
+      );
     }
 
-    const resultsMatch = pathname.match(
-      /^\/jobs\/([^/]+)\/results$/
-    );
+    const resultsMatch =
+      pathname.match(
+        /^\/jobs\/([^/]+)\/results$/
+      );
 
     if (
       request.method === "GET" &&
@@ -1503,13 +2337,16 @@ export default {
       return handleGetJobResults(
         request,
         env,
-        decodeURIComponent(resultsMatch[1])
+        decodeURIComponent(
+          resultsMatch[1]
+        )
       );
     }
 
-    const jobMatch = pathname.match(
-      /^\/jobs\/([^/]+)$/
-    );
+    const jobMatch =
+      pathname.match(
+        /^\/jobs\/([^/]+)$/
+      );
 
     if (
       request.method === "GET" &&
@@ -1517,7 +2354,9 @@ export default {
     ) {
       return handleGetJob(
         env,
-        decodeURIComponent(jobMatch[1])
+        decodeURIComponent(
+          jobMatch[1]
+        )
       );
     }
 
@@ -1525,7 +2364,10 @@ export default {
       request.method === "POST" &&
       pathname === "/batch"
     ) {
-      return handleBatchRequest(request, env);
+      return handleBatchRequest(
+        request,
+        env
+      );
     }
 
     if (
@@ -1535,26 +2377,32 @@ export default {
         pathname === "/scrape"
       )
     ) {
-      return handleSingleRequest(request, env);
+      return handleSingleRequest(
+        request,
+        env
+      );
     }
 
     return json(
       {
         version: VERSION,
         success: false,
-        error: "Endpoint bulunamadı",
+        error:
+          "Endpoint bulunamadı",
         endpoints: {
           single:
             "GET /?url=https://example.com",
+          scrapeMany:
+            "POST /scrape-many — tek cevapta en fazla 20 URL",
           batch:
-            "POST /batch — en fazla 5 URL",
+            "POST /batch — tek cevapta en fazla 5 URL",
           createJob:
-            "POST /jobs — en fazla 100 URL",
+            "POST /jobs — arka planda en fazla 100 URL",
           jobStatus:
             "GET /jobs/:jobId",
           jobResults:
             "GET /jobs/:jobId/results",
-          fullResults:
+          fullJobResults:
             "GET /jobs/:jobId/results?includeText=1"
         }
       },
@@ -1563,6 +2411,9 @@ export default {
   },
 
   async queue(batch, env) {
-    await processQueueBatch(batch, env);
+    await processQueueBatch(
+      batch,
+      env
+    );
   }
 };
