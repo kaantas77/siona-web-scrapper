@@ -1,8 +1,4 @@
-/**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
- */
- {
+{
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "siona-web-scraper-build",
 	"main": "src/index.js",
@@ -14,6 +10,34 @@
   
 	"browser": {
 	  "binding": "BROWSER"
+	},
+  
+	"d1_databases": [
+	  {
+		"binding": "DB",
+		"database_name": "siona-scraper-db",
+		"database_id": "c5b2b6fb-2115-440c-8f12-45620a957799",
+		"remote": true
+	  }
+	],
+  
+	"queues": {
+	  "producers": [
+		{
+		  "binding": "SCRAPE_QUEUE",
+		  "queue": "siona-scrape-queue"
+		}
+	  ],
+  
+	  "consumers": [
+		{
+		  "queue": "siona-scrape-queue",
+		  "max_batch_size": 5,
+		  "max_batch_timeout": 2,
+		  "max_retries": 3,
+		  "dead_letter_queue": "siona-scrape-dlq"
+		}
+	  ]
 	},
   
 	"observability": {

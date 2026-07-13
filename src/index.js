@@ -1,10 +1,18 @@
 import puppeteer from "@cloudflare/puppeteer";
 
-const VERSION = "siona-hybrid-v7";
+const VERSION = "siona-hybrid-v8";
+
 const MAX_TEXT_LENGTH = 50_000;
 const MAX_BATCH_SIZE = 5;
+const MAX_JOB_SIZE = 100;
+
 const FETCH_TIMEOUT_MS = 15_000;
 const BROWSER_TIMEOUT_MS = 30_000;
+const MAX_QUEUE_ATTEMPTS = 3;
+
+/* -------------------------------------------------------------------------- */
+/*                                  RESPONSE                                  */
+/* -------------------------------------------------------------------------- */
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -20,6 +28,18 @@ function json(data, status = 200) {
     }
   });
 }
+
+function getErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               TEXT CLEANING                                */
+/* -------------------------------------------------------------------------- */
 
 function decodeHtmlEntities(text) {
   return text
@@ -86,7 +106,7 @@ function fixMojibake(text) {
 
 function normalizeText(text) {
   return fixMojibake(
-    decodeHtmlEntities(text)
+    decodeHtmlEntities(String(text || ""))
       .replace(/\u00a0/g, " ")
       .replace(/\s+/g, " ")
       .trim()
@@ -151,36 +171,9 @@ async function decodeResponse(response) {
   return windowsText || utf8Text;
 }
 
-function needsBrowser(status, html, text) {
-  if (status >= 400) return true;
-  if (!html || html.length < 500) return true;
-  if (!text || text.length < 80) return true;
-
-  const lowerHtml = html.toLowerCase();
-
-  return (
-    lowerHtml.includes("enable javascript") ||
-    lowerHtml.includes("javascript is required") ||
-    lowerHtml.includes("checking your browser") ||
-    lowerHtml.includes("just a moment") ||
-    lowerHtml.includes("cf-chl-") ||
-    lowerHtml.includes("loading...") ||
-    (lowerHtml.includes("__next_data__") && text.length < 800)
-  );
-}
-
-function isFlashscoreMatchPage(url) {
-  try {
-    const parsedUrl = new URL(url);
-
-    return (
-      parsedUrl.hostname.includes("flashscore.") &&
-      parsedUrl.pathname.includes("/mac/")
-    );
-  } catch {
-    return false;
-  }
-}
+/* -------------------------------------------------------------------------- */
+/*                              URL VALIDATION                                */
+/* -------------------------------------------------------------------------- */
 
 function isPrivateOrLocalHostname(hostname) {
   const value = hostname.toLowerCase();
@@ -244,6 +237,91 @@ function parseAndValidateUrl(input) {
   return parsedUrl;
 }
 
+function normalizeUrl(input) {
+  return parseAndValidateUrl(input).toString();
+}
+
+function normalizeUrlArray(input, maximum) {
+  if (!Array.isArray(input)) {
+    throw new Error('"urls" bir dizi olmalı');
+  }
+
+  const urls = [
+    ...new Set(
+      input
+        .filter((url) => typeof url === "string")
+        .map((url) => url.trim())
+        .filter(Boolean)
+        .map(normalizeUrl)
+    )
+  ];
+
+  if (urls.length === 0) {
+    throw new Error("En az bir URL gerekli");
+  }
+
+  if (urls.length > maximum) {
+    throw new Error(
+      `En fazla ${maximum} farklı URL gönderilebilir`
+    );
+  }
+
+  return urls;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            SCRAPE CLASSIFICATION                           */
+/* -------------------------------------------------------------------------- */
+
+function isFlashscoreMatchPage(url) {
+  try {
+    const parsedUrl = new URL(url);
+
+    return (
+      parsedUrl.hostname.includes("flashscore.") &&
+      parsedUrl.pathname.includes("/mac/")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function needsBrowser(status, html, text) {
+  if (status >= 400) return true;
+  if (!html || html.length < 500) return true;
+  if (!text || text.length < 80) return true;
+
+  const lowerHtml = html.toLowerCase();
+
+  return (
+    lowerHtml.includes("enable javascript") ||
+    lowerHtml.includes("javascript is required") ||
+    lowerHtml.includes("checking your browser") ||
+    lowerHtml.includes("just a moment") ||
+    lowerHtml.includes("cf-chl-") ||
+    lowerHtml.includes("loading...") ||
+    lowerHtml.includes("verify you are human") ||
+    (lowerHtml.includes("__next_data__") && text.length < 800)
+  );
+}
+
+function detectBlockedText(title, text) {
+  const content = `${title || ""} ${text || ""}`.toLowerCase();
+
+  return (
+    content.includes("just a moment") ||
+    content.includes("checking your browser") ||
+    content.includes("verify you are human") ||
+    content.includes("access denied") ||
+    content.includes("unusual traffic") ||
+    content.includes("cf-chl-")
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                 FAST FETCH                                 */
+/* -------------------------------------------------------------------------- */
+
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -289,7 +367,9 @@ async function tryFastFetch(url) {
     if (!contentType.toLowerCase().includes("text/html")) {
       return {
         requiresBrowser: true,
-        reason: `HTML olmayan içerik: ${contentType || "bilinmiyor"}`
+        reason: `HTML olmayan içerik: ${
+          contentType || "bilinmiyor"
+        }`
       };
     }
 
@@ -312,78 +392,88 @@ async function tryFastFetch(url) {
         finalUrl: response.url,
         title: cleaned.title,
         textLength: cleaned.text.length,
+        blocked: false,
         text: cleaned.text.slice(0, MAX_TEXT_LENGTH)
       }
     };
   } catch (error) {
     return {
       requiresBrowser: true,
-      reason:
-        error instanceof Error
-          ? error.message
-          : String(error)
+      reason: getErrorMessage(error)
     };
   }
 }
 
-async function scrapeWithBrowser(url, env) {
-  let browser;
+/* -------------------------------------------------------------------------- */
+/*                              BROWSER SCRAPING                              */
+/* -------------------------------------------------------------------------- */
+
+async function configurePage(page) {
+  await page.setUserAgent(
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+      "AppleWebKit/537.36 (KHTML, like Gecko) " +
+      "Chrome/124.0.0.0 Safari/537.36"
+  );
+
+  await page.setExtraHTTPHeaders({
+    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8"
+  });
+
+  await page.setViewport({
+    width: 1440,
+    height: 1200
+  });
+}
+
+async function waitForRenderedPage(page, url) {
+  if (isFlashscoreMatchPage(url)) {
+    try {
+      await page.waitForFunction(
+        () => {
+          const bodyText = document.body?.innerText || "";
+
+          return (
+            !bodyText.includes("Loading...") &&
+            bodyText.length > 1000
+          );
+        },
+        {
+          timeout: 15_000
+        }
+      );
+    } catch {
+      await new Promise((resolve) =>
+        setTimeout(resolve, 5_000)
+      );
+    }
+
+    return;
+  }
 
   try {
-    browser = await puppeteer.launch(env.BROWSER);
-
-    const page = await browser.newPage();
-
-    await page.setUserAgent(
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
-        "AppleWebKit/537.36 (KHTML, like Gecko) " +
-        "Chrome/124.0.0.0 Safari/537.36"
+    await page.waitForNetworkIdle({
+      idleTime: 1_000,
+      timeout: 10_000
+    });
+  } catch {
+    await new Promise((resolve) =>
+      setTimeout(resolve, 1_500)
     );
+  }
+}
 
-    await page.setExtraHTTPHeaders({
-      "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8"
-    });
+async function scrapePageWithBrowser(browser, url) {
+  const page = await browser.newPage();
 
-    await page.setViewport({
-      width: 1440,
-      height: 1200
-    });
+  try {
+    await configurePage(page);
 
-    await page.goto(url, {
+    const response = await page.goto(url, {
       waitUntil: "domcontentloaded",
       timeout: BROWSER_TIMEOUT_MS
     });
 
-    if (isFlashscoreMatchPage(url)) {
-      try {
-        await page.waitForFunction(
-          () => {
-            const bodyText = document.body?.innerText || "";
-
-            return (
-              !bodyText.includes("Loading...") &&
-              bodyText.length > 1000
-            );
-          },
-          {
-            timeout: 15_000
-          }
-        );
-      } catch {
-        await new Promise((resolve) =>
-          setTimeout(resolve, 5_000)
-        );
-      }
-    } else {
-      try {
-        await page.waitForNetworkIdle({
-          idleTime: 1_000,
-          timeout: 10_000
-        });
-      } catch {
-        // Bazı sitelerde ağ hiç tamamen boş kalmayabilir.
-      }
-    }
+    await waitForRenderedPage(page, url);
 
     const result = await page.evaluate(() => {
       const title = document.title || "";
@@ -402,40 +492,64 @@ async function scrapeWithBrowser(url, env) {
     const title = normalizeText(result.title);
     const text = normalizeText(result.text);
 
-    const stillLoading = text.includes("Loading...");
+    const stillLoading =
+      text.includes("Loading...") ||
+      text.length < 80;
+
+    const blocked = detectBlockedText(title, text);
 
     return {
-      success: !stillLoading && text.length > 80,
+      success:
+        !stillLoading &&
+        !blocked &&
+        text.length > 80,
       method: "browser",
-      status: 200,
+      status: response?.status() || 200,
       finalUrl: page.url(),
       title,
       textLength: text.length,
       stillLoading,
+      blocked,
       text: text.slice(0, MAX_TEXT_LENGTH)
     };
   } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+async function scrapeWithNewBrowser(url, env) {
+  let browser;
+
+  try {
+    browser = await puppeteer.launch(env.BROWSER);
+    return await scrapePageWithBrowser(browser, url);
+  } finally {
     if (browser) {
-      await browser.close();
+      await browser.close().catch(() => {});
     }
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/*                            SINGLE URL SCRAPING                             */
+/* -------------------------------------------------------------------------- */
+
 async function scrapeSingleUrl(url, env) {
-  const parsedUrl = parseAndValidateUrl(url);
-  const normalizedUrl = parsedUrl.toString();
+  const normalizedUrl = normalizeUrl(url);
+  const startedAt = Date.now();
 
   const fastResult = await tryFastFetch(normalizedUrl);
 
   if (!fastResult.requiresBrowser) {
     return {
       requestedUrl: normalizedUrl,
+      durationMs: Date.now() - startedAt,
       ...fastResult.result
     };
   }
 
   try {
-    const browserResult = await scrapeWithBrowser(
+    const browserResult = await scrapeWithNewBrowser(
       normalizedUrl,
       env
     );
@@ -443,6 +557,7 @@ async function scrapeSingleUrl(url, env) {
     return {
       requestedUrl: normalizedUrl,
       fallbackReason: fastResult.reason,
+      durationMs: Date.now() - startedAt,
       ...browserResult
     };
   } catch (error) {
@@ -450,14 +565,561 @@ async function scrapeSingleUrl(url, env) {
       requestedUrl: normalizedUrl,
       success: false,
       method: "browser",
-      error:
-        error instanceof Error
-          ? error.message
-          : String(error),
+      durationMs: Date.now() - startedAt,
+      error: getErrorMessage(error),
       fallbackReason: fastResult.reason
     };
   }
 }
+
+/* -------------------------------------------------------------------------- */
+/*                              D1 JOB HELPERS                                */
+/* -------------------------------------------------------------------------- */
+
+async function createJob(env, urls) {
+  const jobId = `job_${crypto.randomUUID()}`;
+  const createdAt = nowIso();
+
+  const statements = [
+    env.DB.prepare(
+      `
+        INSERT INTO jobs (
+          id,
+          status,
+          total,
+          completed,
+          successful,
+          failed,
+          created_at,
+          updated_at
+        )
+        VALUES (?, 'queued', ?, 0, 0, 0, ?, ?)
+      `
+    ).bind(
+      jobId,
+      urls.length,
+      createdAt,
+      createdAt
+    )
+  ];
+
+  const items = urls.map((url, index) => {
+    const itemId =
+      `item_${String(index + 1).padStart(3, "0")}_` +
+      crypto.randomUUID();
+
+    statements.push(
+      env.DB.prepare(
+        `
+          INSERT INTO job_items (
+            id,
+            job_id,
+            url,
+            status,
+            created_at,
+            updated_at
+          )
+          VALUES (?, ?, ?, 'queued', ?, ?)
+        `
+      ).bind(
+        itemId,
+        jobId,
+        url,
+        createdAt,
+        createdAt
+      )
+    );
+
+    return {
+      itemId,
+      jobId,
+      url
+    };
+  });
+
+  await env.DB.batch(statements);
+
+  return {
+    jobId,
+    items
+  };
+}
+
+async function getJob(env, jobId) {
+  return env.DB.prepare(
+    `
+      SELECT
+        id,
+        status,
+        total,
+        completed,
+        successful,
+        failed,
+        created_at,
+        updated_at
+      FROM jobs
+      WHERE id = ?
+    `
+  )
+    .bind(jobId)
+    .first();
+}
+
+async function getJobItem(env, itemId) {
+  return env.DB.prepare(
+    `
+      SELECT
+        id,
+        job_id,
+        url,
+        status,
+        method,
+        title,
+        text_length,
+        final_url,
+        error,
+        duration_ms,
+        created_at,
+        updated_at
+      FROM job_items
+      WHERE id = ?
+    `
+  )
+    .bind(itemId)
+    .first();
+}
+
+async function markItemProcessing(env, itemId) {
+  await env.DB.prepare(
+    `
+      UPDATE job_items
+      SET
+        status = 'processing',
+        error = NULL,
+        updated_at = ?
+      WHERE id = ?
+    `
+  )
+    .bind(nowIso(), itemId)
+    .run();
+}
+
+async function saveItemResult(
+  env,
+  jobId,
+  itemId,
+  result
+) {
+  const itemStatus = result.success
+    ? "completed"
+    : "failed";
+
+  await env.DB.prepare(
+    `
+      UPDATE job_items
+      SET
+        status = ?,
+        method = ?,
+        title = ?,
+        text = ?,
+        text_length = ?,
+        final_url = ?,
+        error = ?,
+        duration_ms = ?,
+        updated_at = ?
+      WHERE id = ? AND job_id = ?
+    `
+  )
+    .bind(
+      itemStatus,
+      result.method || null,
+      result.title || null,
+      result.text || null,
+      result.textLength || 0,
+      result.finalUrl || null,
+      result.error || null,
+      result.durationMs || 0,
+      nowIso(),
+      itemId,
+      jobId
+    )
+    .run();
+
+  await refreshJobStatus(env, jobId);
+}
+
+async function markItemForRetry(
+  env,
+  itemId,
+  errorMessage
+) {
+  await env.DB.prepare(
+    `
+      UPDATE job_items
+      SET
+        status = 'queued',
+        error = ?,
+        updated_at = ?
+      WHERE id = ?
+    `
+  )
+    .bind(
+      errorMessage,
+      nowIso(),
+      itemId
+    )
+    .run();
+}
+
+async function markItemPermanentlyFailed(
+  env,
+  jobId,
+  itemId,
+  errorMessage
+) {
+  await env.DB.prepare(
+    `
+      UPDATE job_items
+      SET
+        status = 'failed',
+        error = ?,
+        updated_at = ?
+      WHERE id = ? AND job_id = ?
+    `
+  )
+    .bind(
+      errorMessage,
+      nowIso(),
+      itemId,
+      jobId
+    )
+    .run();
+
+  await refreshJobStatus(env, jobId);
+}
+
+async function refreshJobStatus(env, jobId) {
+  const counts = await env.DB.prepare(
+    `
+      SELECT
+        COUNT(*) AS total,
+        SUM(
+          CASE WHEN status = 'completed'
+          THEN 1 ELSE 0 END
+        ) AS successful,
+        SUM(
+          CASE WHEN status = 'failed'
+          THEN 1 ELSE 0 END
+        ) AS failed,
+        SUM(
+          CASE
+            WHEN status IN ('completed', 'failed')
+            THEN 1 ELSE 0
+          END
+        ) AS completed
+      FROM job_items
+      WHERE job_id = ?
+    `
+  )
+    .bind(jobId)
+    .first();
+
+  const total = Number(counts?.total || 0);
+  const successful = Number(counts?.successful || 0);
+  const failed = Number(counts?.failed || 0);
+  const completed = Number(counts?.completed || 0);
+
+  let status = "processing";
+
+  if (completed >= total && total > 0) {
+    status = failed > 0
+      ? "completed_with_errors"
+      : "completed";
+  } else if (completed === 0) {
+    status = "queued";
+  }
+
+  await env.DB.prepare(
+    `
+      UPDATE jobs
+      SET
+        status = ?,
+        total = ?,
+        completed = ?,
+        successful = ?,
+        failed = ?,
+        updated_at = ?
+      WHERE id = ?
+    `
+  )
+    .bind(
+      status,
+      total,
+      completed,
+      successful,
+      failed,
+      nowIso(),
+      jobId
+    )
+    .run();
+}
+
+async function markJobEnqueueFailed(
+  env,
+  jobId,
+  errorMessage
+) {
+  const updatedAt = nowIso();
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `
+        UPDATE job_items
+        SET
+          status = 'failed',
+          error = ?,
+          updated_at = ?
+        WHERE job_id = ?
+      `
+    ).bind(
+      `Queue gönderimi başarısız: ${errorMessage}`,
+      updatedAt,
+      jobId
+    ),
+
+    env.DB.prepare(
+      `
+        UPDATE jobs
+        SET
+          status = 'failed',
+          completed = total,
+          successful = 0,
+          failed = total,
+          updated_at = ?
+        WHERE id = ?
+      `
+    ).bind(updatedAt, jobId)
+  ]);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              JOB ENDPOINTS                                 */
+/* -------------------------------------------------------------------------- */
+
+async function handleCreateJob(request, env) {
+  let body;
+
+  try {
+    body = await request.json();
+  } catch {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: "Geçerli JSON gövdesi gerekli"
+      },
+      400
+    );
+  }
+
+  let urls;
+
+  try {
+    urls = normalizeUrlArray(
+      body.urls,
+      MAX_JOB_SIZE
+    );
+  } catch (error) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: getErrorMessage(error)
+      },
+      400
+    );
+  }
+
+  let createdJob;
+
+  try {
+    createdJob = await createJob(env, urls);
+  } catch (error) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: `D1 job oluşturulamadı: ${getErrorMessage(
+          error
+        )}`
+      },
+      500
+    );
+  }
+
+  try {
+    await env.SCRAPE_QUEUE.sendBatch(
+      createdJob.items.map((item) => ({
+        body: {
+          type: "scrape_url",
+          jobId: item.jobId,
+          itemId: item.itemId,
+          url: item.url
+        }
+      }))
+    );
+  } catch (error) {
+    const message = getErrorMessage(error);
+
+    await markJobEnqueueFailed(
+      env,
+      createdJob.jobId,
+      message
+    );
+
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        jobId: createdJob.jobId,
+        error: `Queue gönderimi başarısız: ${message}`
+      },
+      500
+    );
+  }
+
+  return json(
+    {
+      version: VERSION,
+      success: true,
+      jobId: createdJob.jobId,
+      status: "queued",
+      total: urls.length,
+      statusUrl: `/jobs/${createdJob.jobId}`,
+      resultsUrl: `/jobs/${createdJob.jobId}/results`
+    },
+    202
+  );
+}
+
+async function handleGetJob(env, jobId) {
+  const job = await getJob(env, jobId);
+
+  if (!job) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: "Job bulunamadı"
+      },
+      404
+    );
+  }
+
+  const total = Number(job.total || 0);
+  const completed = Number(job.completed || 0);
+
+  return json({
+    version: VERSION,
+    success: true,
+    job: {
+      ...job,
+      total,
+      completed,
+      successful: Number(job.successful || 0),
+      failed: Number(job.failed || 0),
+      pending: Math.max(0, total - completed),
+      progress:
+        total > 0
+          ? Math.round((completed / total) * 100)
+          : 0
+    }
+  });
+}
+
+async function handleGetJobResults(
+  request,
+  env,
+  jobId
+) {
+  const job = await getJob(env, jobId);
+
+  if (!job) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: "Job bulunamadı"
+      },
+      404
+    );
+  }
+
+  const requestUrl = new URL(request.url);
+
+  const page = Math.max(
+    1,
+    Number(requestUrl.searchParams.get("page") || 1)
+  );
+
+  const limit = Math.min(
+    20,
+    Math.max(
+      1,
+      Number(requestUrl.searchParams.get("limit") || 10)
+    )
+  );
+
+  const includeText =
+    requestUrl.searchParams.get("includeText") === "1" ||
+    requestUrl.searchParams.get("includeText") === "true";
+
+  const offset = (page - 1) * limit;
+
+  const selectText = includeText
+    ? ", text"
+    : "";
+
+  const query = `
+    SELECT
+      id,
+      url,
+      status,
+      method,
+      title,
+      text_length,
+      final_url,
+      error,
+      duration_ms,
+      created_at,
+      updated_at
+      ${selectText}
+    FROM job_items
+    WHERE job_id = ?
+    ORDER BY created_at ASC
+    LIMIT ? OFFSET ?
+  `;
+
+  const result = await env.DB.prepare(query)
+    .bind(jobId, limit, offset)
+    .all();
+
+  return json({
+    version: VERSION,
+    success: true,
+    jobId,
+    status: job.status,
+    total: Number(job.total || 0),
+    page,
+    limit,
+    includeText,
+    results: result.results || []
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            LEGACY ENDPOINTS                                */
+/* -------------------------------------------------------------------------- */
 
 async function handleSingleRequest(request, env) {
   const requestUrl = new URL(request.url);
@@ -476,7 +1138,10 @@ async function handleSingleRequest(request, env) {
   }
 
   try {
-    const result = await scrapeSingleUrl(targetUrl, env);
+    const result = await scrapeSingleUrl(
+      targetUrl,
+      env
+    );
 
     return json({
       version: VERSION,
@@ -487,10 +1152,7 @@ async function handleSingleRequest(request, env) {
       {
         version: VERSION,
         success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : String(error)
+        error: getErrorMessage(error)
       },
       400
     );
@@ -513,43 +1175,19 @@ async function handleBatchRequest(request, env) {
     );
   }
 
-  if (!Array.isArray(body.urls)) {
-    return json(
-      {
-        version: VERSION,
-        success: false,
-        error: '"urls" bir dizi olmalı'
-      },
-      400
+  let urls;
+
+  try {
+    urls = normalizeUrlArray(
+      body.urls,
+      MAX_BATCH_SIZE
     );
-  }
-
-  const urls = [
-    ...new Set(
-      body.urls
-        .filter((url) => typeof url === "string")
-        .map((url) => url.trim())
-        .filter(Boolean)
-    )
-  ];
-
-  if (urls.length === 0) {
+  } catch (error) {
     return json(
       {
         version: VERSION,
         success: false,
-        error: "En az bir URL gerekli"
-      },
-      400
-    );
-  }
-
-  if (urls.length > MAX_BATCH_SIZE) {
-    return json(
-      {
-        version: VERSION,
-        success: false,
-        error: `Tek batch içinde en fazla ${MAX_BATCH_SIZE} URL gönderilebilir`
+        error: getErrorMessage(error)
       },
       400
     );
@@ -565,10 +1203,7 @@ async function handleBatchRequest(request, env) {
         return {
           requestedUrl: url,
           success: false,
-          error:
-            error instanceof Error
-              ? error.message
-              : String(error)
+          error: getErrorMessage(error)
         };
       }
     })
@@ -589,6 +1224,248 @@ async function handleBatchRequest(request, env) {
   });
 }
 
+/* -------------------------------------------------------------------------- */
+/*                             QUEUE PROCESSOR                                */
+/* -------------------------------------------------------------------------- */
+
+async function processQueueMessageWithResult(
+  env,
+  messageData,
+  result
+) {
+  await saveItemResult(
+    env,
+    messageData.jobId,
+    messageData.itemId,
+    result
+  );
+}
+
+async function processQueueBatch(batch, env) {
+  const pendingMessages = [];
+
+  for (const message of batch.messages) {
+    const data = message.body;
+
+    if (
+      !data ||
+      data.type !== "scrape_url" ||
+      !data.jobId ||
+      !data.itemId ||
+      !data.url
+    ) {
+      message.ack();
+      continue;
+    }
+
+    const currentItem = await getJobItem(
+      env,
+      data.itemId
+    );
+
+    if (!currentItem) {
+      message.ack();
+      continue;
+    }
+
+    if (
+      currentItem.status === "completed" ||
+      currentItem.status === "failed"
+    ) {
+      message.ack();
+      continue;
+    }
+
+    await markItemProcessing(env, data.itemId);
+
+    pendingMessages.push({
+      message,
+      data,
+      startedAt: Date.now()
+    });
+  }
+
+  if (pendingMessages.length === 0) {
+    return;
+  }
+
+  /*
+   * Aynı Queue batch'indeki hızlı fetch işlemlerini paralel yapıyoruz.
+   * Wrangler max_batch_size değerimiz 5 olduğu için bir invocation
+   * içerisinde 5 fetch'i geçmiyoruz.
+   */
+  const fastResults = await Promise.all(
+    pendingMessages.map(async (entry) => {
+      try {
+        return {
+          entry,
+          fastResult: await tryFastFetch(entry.data.url)
+        };
+      } catch (error) {
+        return {
+          entry,
+          fastError: error
+        };
+      }
+    })
+  );
+
+  const browserEntries = [];
+
+  for (const item of fastResults) {
+    const { entry } = item;
+
+    if (item.fastError) {
+      browserEntries.push({
+        ...entry,
+        fallbackReason: getErrorMessage(
+          item.fastError
+        )
+      });
+
+      continue;
+    }
+
+    if (!item.fastResult.requiresBrowser) {
+      const result = {
+        requestedUrl: entry.data.url,
+        durationMs:
+          Date.now() - entry.startedAt,
+        ...item.fastResult.result
+      };
+
+      await processQueueMessageWithResult(
+        env,
+        entry.data,
+        result
+      );
+
+      entry.message.ack();
+      continue;
+    }
+
+    browserEntries.push({
+      ...entry,
+      fallbackReason: item.fastResult.reason
+    });
+  }
+
+  if (browserEntries.length === 0) {
+    return;
+  }
+
+  let browser;
+
+  try {
+    /*
+     * Bir Queue batch'i için tek browser açıyoruz.
+     * Browser gereken URL'ler aynı browser oturumunda yeni sayfalarla
+     * sırayla işleniyor.
+     */
+    browser = await puppeteer.launch(env.BROWSER);
+
+    for (const entry of browserEntries) {
+      try {
+        const browserResult =
+          await scrapePageWithBrowser(
+            browser,
+            entry.data.url
+          );
+
+        const result = {
+          requestedUrl: entry.data.url,
+          fallbackReason: entry.fallbackReason,
+          durationMs:
+            Date.now() - entry.startedAt,
+          ...browserResult
+        };
+
+        await processQueueMessageWithResult(
+          env,
+          entry.data,
+          result
+        );
+
+        entry.message.ack();
+      } catch (error) {
+        const errorMessage = getErrorMessage(error);
+
+        if (
+          entry.message.attempts >=
+          MAX_QUEUE_ATTEMPTS
+        ) {
+          await markItemPermanentlyFailed(
+            env,
+            entry.data.jobId,
+            entry.data.itemId,
+            errorMessage
+          );
+
+          entry.message.ack();
+        } else {
+          await markItemForRetry(
+            env,
+            entry.data.itemId,
+            errorMessage
+          );
+
+          entry.message.retry({
+            delaySeconds: Math.min(
+              30,
+              Math.max(
+                2,
+                2 ** entry.message.attempts
+              )
+            )
+          });
+        }
+      }
+    }
+  } catch (error) {
+    const errorMessage = getErrorMessage(error);
+
+    for (const entry of browserEntries) {
+      if (
+        entry.message.attempts >=
+        MAX_QUEUE_ATTEMPTS
+      ) {
+        await markItemPermanentlyFailed(
+          env,
+          entry.data.jobId,
+          entry.data.itemId,
+          errorMessage
+        );
+
+        entry.message.ack();
+      } else {
+        await markItemForRetry(
+          env,
+          entry.data.itemId,
+          errorMessage
+        );
+
+        entry.message.retry({
+          delaySeconds: Math.min(
+            30,
+            Math.max(
+              2,
+              2 ** entry.message.attempts
+            )
+          )
+        });
+      }
+    }
+  } finally {
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  ROUTER                                    */
+/* -------------------------------------------------------------------------- */
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
@@ -596,18 +1473,57 @@ export default {
         status: 204,
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
+          "Access-Control-Allow-Methods":
+            "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers":
+            "Content-Type",
           "Cache-Control": "no-store"
         }
       });
     }
 
     const requestUrl = new URL(request.url);
+    const pathname = requestUrl.pathname;
 
     if (
       request.method === "POST" &&
-      requestUrl.pathname === "/batch"
+      pathname === "/jobs"
+    ) {
+      return handleCreateJob(request, env);
+    }
+
+    const resultsMatch = pathname.match(
+      /^\/jobs\/([^/]+)\/results$/
+    );
+
+    if (
+      request.method === "GET" &&
+      resultsMatch
+    ) {
+      return handleGetJobResults(
+        request,
+        env,
+        decodeURIComponent(resultsMatch[1])
+      );
+    }
+
+    const jobMatch = pathname.match(
+      /^\/jobs\/([^/]+)$/
+    );
+
+    if (
+      request.method === "GET" &&
+      jobMatch
+    ) {
+      return handleGetJob(
+        env,
+        decodeURIComponent(jobMatch[1])
+      );
+    }
+
+    if (
+      request.method === "POST" &&
+      pathname === "/batch"
     ) {
       return handleBatchRequest(request, env);
     }
@@ -615,8 +1531,8 @@ export default {
     if (
       request.method === "GET" &&
       (
-        requestUrl.pathname === "/" ||
-        requestUrl.pathname === "/scrape"
+        pathname === "/" ||
+        pathname === "/scrape"
       )
     ) {
       return handleSingleRequest(request, env);
@@ -628,11 +1544,25 @@ export default {
         success: false,
         error: "Endpoint bulunamadı",
         endpoints: {
-          single: "GET /?url=https://example.com",
-          batch: "POST /batch"
+          single:
+            "GET /?url=https://example.com",
+          batch:
+            "POST /batch — en fazla 5 URL",
+          createJob:
+            "POST /jobs — en fazla 100 URL",
+          jobStatus:
+            "GET /jobs/:jobId",
+          jobResults:
+            "GET /jobs/:jobId/results",
+          fullResults:
+            "GET /jobs/:jobId/results?includeText=1"
         }
       },
       404
     );
+  },
+
+  async queue(batch, env) {
+    await processQueueBatch(batch, env);
   }
 };
