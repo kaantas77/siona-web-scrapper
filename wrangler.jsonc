@@ -21,6 +21,25 @@
 	  }
 	],
   
+	"durable_objects": {
+	  "bindings": [
+		{ "name": "BROWSER_POOL", "class_name": "BrowserPool" },
+		{ "name": "LAUNCH_COORDINATOR", "class_name": "LaunchCoordinator" }
+	  ]
+	},
+
+	"migrations": [
+	  {
+		"tag": "v12-browser-pool",
+		"new_sqlite_classes": ["BrowserPool", "LaunchCoordinator"]
+	  }
+	],
+
+	"vars": {
+	  "POOL_COUNT": "20",
+	  "TABS_PER_POOL": "5"
+	},
+
 	"queues": {
 	  "producers": [
 		{

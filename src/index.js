@@ -1,7 +1,10 @@
 import puppeteer from "@cloudflare/puppeteer";
 import { extractContent } from "./extractors/index.js";
+import { BrowserPool, LaunchCoordinator } from "./browser/browser-pool.js";
 
 const VERSION = "siona-hybrid-v9";
+
+export { BrowserPool, LaunchCoordinator };
 
 const MAX_TEXT_LENGTH = 50_000;
 
@@ -2477,7 +2480,38 @@ async function processQueueBatch(
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                  ROUTER                                    */
+async function handleWarmPools(request, env) {
+  if (!env.ADMIN_TOKEN) {
+    return json({ success: false, error: "Admin warm-up is not configured" }, 503);
+  }
+  const authorization = request.headers.get("Authorization") || "";
+  if (authorization !== `Bearer ${env.ADMIN_TOKEN}`) {
+    return json({ success: false, error: "Unauthorized" }, 401);
+  }
+  const poolCount = Math.max(1, Number(env.POOL_COUNT || 20));
+  const startedAt = Date.now();
+  const pools = await Promise.all(Array.from({ length: poolCount }, async (_, index) => {
+    try {
+      const id = env.BROWSER_POOL.idFromName(`pool-${index}`);
+      const response = await env.BROWSER_POOL.get(id).fetch(
+        "https://browser-pool/warm",
+        { method: "POST" }
+      );
+      const body = await response.json();
+      return { index, ...body };
+    } catch (error) {
+      return { index, success: false, error: getErrorMessage(error) };
+    }
+  }));
+  return json({
+    success: pools.every((pool) => pool.success),
+    poolCount,
+    readyPools: pools.filter((pool) => pool.success).length,
+    durationMs: Date.now() - startedAt,
+    pools
+  });
+}
+
 /* -------------------------------------------------------------------------- */
 
 export default {
@@ -2511,6 +2545,13 @@ export default {
       pathname === "/health"
     ) {
       return healthResponse();
+    }
+
+    if (
+      request.method === "POST" &&
+      pathname === "/admin/warm-pools"
+    ) {
+      return handleWarmPools(request, env);
     }
 
     if (

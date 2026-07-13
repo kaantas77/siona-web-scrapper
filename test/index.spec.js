@@ -32,3 +32,17 @@ describe("health endpoint", () => {
 		});
 	});
 });
+
+describe("browser pool warm-up guard", () => {
+	it("does not expose warm-up without an admin token", async () => {
+		const request = new Request("http://example.com/admin/warm-pools", {
+			method: "POST"
+		});
+		const response = await worker.fetch(request, {}, createExecutionContext());
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({
+			success: false,
+			error: "Admin warm-up is not configured"
+		});
+	});
+});
