@@ -18,6 +18,7 @@ describe("health endpoint", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toMatchObject({
 			success: true,
+			version: "siona-v12-browser-pool",
 			service: "siona-web-scraper",
 			architecture: "hybrid-fetch-browser"
 		});

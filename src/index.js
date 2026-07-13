@@ -2,7 +2,7 @@ import puppeteer from "@cloudflare/puppeteer";
 import { extractContent } from "./extractors/index.js";
 import { BrowserPool, LaunchCoordinator } from "./browser/browser-pool.js";
 
-const VERSION = "siona-hybrid-v9";
+const VERSION = "siona-v12-browser-pool";
 
 export { BrowserPool, LaunchCoordinator };
 
