@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   successful INTEGER NOT NULL DEFAULT 0,
   failed INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  extraction_mode TEXT NOT NULL DEFAULT 'auto'
 );
 
 CREATE TABLE IF NOT EXISTS job_items (
@@ -19,6 +20,9 @@ CREATE TABLE IF NOT EXISTS job_items (
   text TEXT,
   text_length INTEGER DEFAULT 0,
   final_url TEXT,
+  extractor TEXT,
+  extraction_json TEXT,
+  extraction_ms INTEGER DEFAULT 0,
   error TEXT,
   duration_ms INTEGER DEFAULT 0,
   created_at TEXT NOT NULL,

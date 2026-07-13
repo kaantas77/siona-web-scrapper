@@ -1144,7 +1144,8 @@ async function scrapeManySynchronously(
 
 async function createJob(
   env,
-  urls
+  urls,
+  extractionMode = "auto"
 ) {
   const jobId =
     `job_${crypto.randomUUID()}`;
@@ -1162,7 +1163,8 @@ async function createJob(
           successful,
           failed,
           created_at,
-          updated_at
+          updated_at,
+          extraction_mode
         )
         VALUES (
           ?,
@@ -1172,6 +1174,7 @@ async function createJob(
           0,
           0,
           ?,
+          ?,
           ?
         )
       `
@@ -1179,7 +1182,8 @@ async function createJob(
       jobId,
       urls.length,
       createdAt,
-      createdAt
+      createdAt,
+      extractionMode
     )
   ];
 
@@ -1252,7 +1256,8 @@ async function getJob(
         successful,
         failed,
         created_at,
-        updated_at
+        updated_at,
+        extraction_mode
       FROM jobs
       WHERE id = ?
     `
@@ -1330,6 +1335,9 @@ async function saveItemResult(
         text = ?,
         text_length = ?,
         final_url = ?,
+        extractor = ?,
+        extraction_json = ?,
+        extraction_ms = ?,
         error = ?,
         duration_ms = ?,
         updated_at = ?
@@ -1345,6 +1353,11 @@ async function saveItemResult(
       result.text || null,
       result.textLength || 0,
       result.finalUrl || null,
+      result.extractor || null,
+      result.extraction
+        ? JSON.stringify(result.extraction)
+        : null,
+      result.extractionMs || 0,
       result.error || null,
       result.durationMs || 0,
       nowIso(),
@@ -1591,6 +1604,23 @@ async function handleCreateJob(
     );
   }
 
+  let extractionMode;
+
+  try {
+    extractionMode = normalizeExtractionMode(
+      body.options?.extract ?? body.extract
+    );
+  } catch (error) {
+    return json(
+      {
+        version: VERSION,
+        success: false,
+        error: getErrorMessage(error)
+      },
+      400
+    );
+  }
+
   let urls;
 
   try {
@@ -1616,7 +1646,8 @@ async function handleCreateJob(
     createdJob =
       await createJob(
         env,
-        urls
+        urls,
+        extractionMode
       );
   } catch (error) {
     return json(
@@ -1640,7 +1671,8 @@ async function handleCreateJob(
             type: "scrape_url",
             jobId: item.jobId,
             itemId: item.itemId,
-            url: item.url
+            url: item.url,
+            extractionMode
           }
         })
       )
@@ -1676,6 +1708,7 @@ async function handleCreateJob(
       jobId:
         createdJob.jobId,
       status: "queued",
+      extraction: extractionMode,
       total: urls.length,
       statusUrl:
         `/jobs/${createdJob.jobId}`,
@@ -1838,6 +1871,9 @@ async function handleGetJobResults(
       error,
       duration_ms,
       created_at,
+      extractor,
+      extraction_json,
+      extraction_ms,
       updated_at
       ${selectText}
     FROM job_items
@@ -1860,13 +1896,31 @@ async function handleGetJobResults(
     success: true,
     jobId,
     status: job.status,
+    extraction: job.extraction_mode || "auto",
     total:
       Number(job.total || 0),
     page,
     limit,
     includeText,
     results:
-      result.results || []
+      (result.results || []).map((item) => {
+        if (!item.extraction_json) {
+          return item;
+        }
+
+        let extraction = null;
+        try {
+          extraction = JSON.parse(item.extraction_json);
+        } catch {
+          extraction = null;
+        }
+
+        const { extraction_json, ...withoutRawExtraction } = item;
+        return {
+          ...withoutRawExtraction,
+          extraction
+        };
+      })
   });
 }
 
@@ -2189,7 +2243,8 @@ async function processQueueBatch(
             entry,
             fastResult:
               await tryFastFetch(
-                entry.data.url
+                entry.data.url,
+                entry.data.extractionMode
               )
           };
         } catch (error) {
@@ -2274,7 +2329,8 @@ async function processQueueBatch(
             const browserResult =
               await scrapePageWithBrowser(
                 browser,
-                entry.data.url
+                entry.data.url,
+                entry.data.extractionMode
               );
 
             return {
