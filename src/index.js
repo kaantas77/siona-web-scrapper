@@ -10,7 +10,9 @@ const MAX_TEXT_LENGTH = 50_000;
 
 const MAX_LEGACY_BATCH_SIZE = 5;
 const MAX_SYNC_BATCH_SIZE = 20;
-const MAX_JOB_SIZE = 100;
+const MAX_JOB_SIZE = 1_500;
+const MAX_QUEUE_BATCH_SIZE = 100;
+const MAX_D1_BATCH_SIZE = 50;
 
 const FETCH_CONCURRENCY = 6;
 const BROWSER_PAGE_CONCURRENCY = 3;
@@ -1423,85 +1425,36 @@ async function createJob(
     env.DB.prepare(
       `
         INSERT INTO jobs (
-          id,
-          status,
-          total,
-          completed,
-          successful,
-          failed,
-          created_at,
-          updated_at,
-          extraction_mode
+          id, status, total, completed, successful, failed,
+          created_at, updated_at, extraction_mode
         )
-        VALUES (
-          ?,
-          'queued',
-          ?,
-          0,
-          0,
-          0,
-          ?,
-          ?,
-          ?
-        )
+        VALUES (?, 'queued', ?, 0, 0, 0, ?, ?, ?)
       `
-    ).bind(
-      jobId,
-      urls.length,
-      createdAt,
-      createdAt,
-      extractionMode
-    )
+    ).bind(jobId, urls.length, createdAt, createdAt, extractionMode)
   ];
 
-  const items = urls.map(
-    (url, index) => {
-      const itemId =
-        `item_${String(
-          index + 1
-        ).padStart(3, "0")}_` +
-        crypto.randomUUID();
+  const items = urls.map((url, index) => {
+    const itemId =
+      `item_${String(index + 1).padStart(4, "0")}_` +
+      crypto.randomUUID();
 
-      statements.push(
-        env.DB.prepare(
-          `
-            INSERT INTO job_items (
-              id,
-              job_id,
-              url,
-              status,
-              created_at,
-              updated_at
-            )
-            VALUES (
-              ?,
-              ?,
-              ?,
-              'queued',
-              ?,
-              ?
-            )
-          `
-        ).bind(
-          itemId,
-          jobId,
-          url,
-          createdAt,
-          createdAt
-        )
-      );
+    statements.push(
+      env.DB.prepare(
+        `
+          INSERT INTO job_items (
+            id, job_id, url, status, created_at, updated_at
+          )
+          VALUES (?, ?, ?, 'queued', ?, ?)
+        `
+      ).bind(itemId, jobId, url, createdAt, createdAt)
+    );
 
-      return {
-        itemId,
-        jobId,
-        url
-      };
-    }
-  );
+    return { itemId, jobId, url };
+  });
 
-  await env.DB.batch(
-    statements
-  );
+  for (let offset = 0; offset < statements.length; offset += MAX_D1_BATCH_SIZE) {
+    await env.DB.batch(statements.slice(offset, offset + MAX_D1_BATCH_SIZE));
+  }
 
   return {
     jobId,
@@ -1935,19 +1888,21 @@ async function handleCreateJob(
   }
 
   try {
-    await env.SCRAPE_QUEUE.sendBatch(
-      createdJob.items.map(
-        (item) => ({
-          body: {
-            type: "scrape_url",
-            jobId: item.jobId,
-            itemId: item.itemId,
-            url: item.url,
-            extractionMode
-          }
-        })
-      )
-    );
+    const messages = createdJob.items.map((item) => ({
+      body: {
+        type: "scrape_url",
+        jobId: item.jobId,
+        itemId: item.itemId,
+        url: item.url,
+        extractionMode
+      }
+    }));
+
+    for (let offset = 0; offset < messages.length; offset += MAX_QUEUE_BATCH_SIZE) {
+      await env.SCRAPE_QUEUE.sendBatch(
+        messages.slice(offset, offset + MAX_QUEUE_BATCH_SIZE)
+      );
+    }
   } catch (error) {
     const message =
       getErrorMessage(error);

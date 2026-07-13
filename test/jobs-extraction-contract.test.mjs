@@ -9,7 +9,7 @@ const migration = fs.readFileSync(new URL("../migration-extraction.sql", import.
 test("async jobs persist and propagate the extraction mode", () => {
   assert.match(schema, /extraction_mode TEXT NOT NULL DEFAULT 'auto'/);
   assert.match(source, /body\.options\?\.extract \?\? body\.extract/);
-  assert.match(source, /extractionMode\n          \}/);
+  assert.match(source, /extractionMode\s*\}/);
   assert.match(source, /entry\.data\.extractionMode/);
   assert.match(source, /extraction: extractionMode/);
 });

@@ -60,9 +60,10 @@
 	  "consumers": [
 		{
 		  "queue": "siona-scrape-queue",
-		  "max_batch_size": 5,
-		  "max_batch_timeout": 2,
+		  "max_batch_size": 10,
+		  "max_batch_timeout": 1,
 		  "max_retries": 3,
+		  "max_concurrency": 40,
 		  "dead_letter_queue": "siona-scrape-dlq"
 		}
 	  ]

@@ -24,3 +24,13 @@ test("research endpoints reuse the existing validated job contract", () => {
   assert.match(source, /statusUrl: `\/research-jobs\/\$\{body\.jobId\}`/);
   assert.match(source, /api: "research"/);
 });
+
+
+test("async capacity is sized for 100 users with 15 URLs each", () => {
+  assert.match(source, /const MAX_JOB_SIZE = 1_500/);
+  assert.match(source, /const MAX_QUEUE_BATCH_SIZE = 100/);
+  assert.match(source, /const MAX_D1_BATCH_SIZE = 50/);
+  assert.match(source, /messages\.slice\(offset, offset \+ MAX_QUEUE_BATCH_SIZE\)/);
+  assert.match(source, /statements\.slice\(offset, offset \+ MAX_D1_BATCH_SIZE\)/);
+  assert.match(wrangler, /\"max_concurrency\": 40/);
+});
