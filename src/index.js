@@ -1,4 +1,5 @@
 import puppeteer from "@cloudflare/puppeteer";
+import { extractContent } from "./extractors/index.js";
 
 const VERSION = "siona-hybrid-v9";
 
@@ -577,6 +578,17 @@ async function tryFastFetch(url) {
       };
     }
 
+    const extraction = extractContent({
+      url,
+      title: cleaned.title,
+      text: cleaned.text,
+      rawText: cleaned.text
+    });
+
+    const outputText = extraction.success
+      ? extraction.cleanText
+      : cleaned.text;
+
     return {
       requiresBrowser: false,
       result: {
@@ -586,9 +598,17 @@ async function tryFastFetch(url) {
         finalUrl: response.url,
         title: cleaned.title,
         textLength:
-          cleaned.text.length,
+          outputText.length,
+        extractor: extraction.extractor,
+        extraction: {
+          success: extraction.success,
+          type: extraction.type,
+          structured: extraction.structured,
+          cleanText: extraction.cleanText
+        },
+        extractionMs: extraction.extractionMs,
         blocked: false,
-        text: cleaned.text.slice(
+        text: outputText.slice(
           0,
           MAX_TEXT_LENGTH
         )
@@ -724,6 +744,17 @@ async function scrapePageWithBrowser(
         text
       );
 
+    const extraction = extractContent({
+      url,
+      title,
+      text,
+      rawText: text
+    });
+
+    const outputText = extraction.success
+      ? extraction.cleanText
+      : text;
+
     return {
       success:
         !stillLoading &&
@@ -734,10 +765,18 @@ async function scrapePageWithBrowser(
         response?.status() || 200,
       finalUrl: page.url(),
       title,
-      textLength: text.length,
+      textLength: outputText.length,
+      extractor: extraction.extractor,
+      extraction: {
+        success: extraction.success,
+        type: extraction.type,
+        structured: extraction.structured,
+        cleanText: extraction.cleanText
+      },
+      extractionMs: extraction.extractionMs,
       stillLoading,
       blocked,
-      text: text.slice(
+      text: outputText.slice(
         0,
         MAX_TEXT_LENGTH
       )
