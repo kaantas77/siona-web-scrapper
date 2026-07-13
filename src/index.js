@@ -55,6 +55,20 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function healthResponse() {
+  return json({
+    version: VERSION,
+    success: true,
+    service: "siona-web-scraper",
+    architecture: "hybrid-fetch-browser",
+    limits: {
+      maxSyncUrls: MAX_SYNC_BATCH_SIZE,
+      maxAsyncUrls: MAX_JOB_SIZE,
+      maxTextLength: MAX_TEXT_LENGTH
+    }
+  });
+}
+
 /* -------------------------------------------------------------------------- */
 /*                               CONCURRENCY                                  */
 /* -------------------------------------------------------------------------- */
@@ -2491,6 +2505,13 @@ export default {
 
     const pathname =
       requestUrl.pathname;
+
+    if (
+      request.method === "GET" &&
+      pathname === "/health"
+    ) {
+      return healthResponse();
+    }
 
     if (
       request.method === "POST" &&
