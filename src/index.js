@@ -1248,6 +1248,25 @@ async function scrapeManySynchronously(
   );
 }
 
+async function persistResultToR2(env, jobId, itemId, result) {
+  if (!env.RESULTS || !result?.success) return null;
+
+  const key = `scrape-results/${jobId}/${itemId}.json`;
+  try {
+    await env.RESULTS.put(key, JSON.stringify({
+      version: VERSION,
+      jobId,
+      itemId,
+      result
+    }), {
+      httpMetadata: { contentType: "application/json; charset=utf-8" }
+    });
+    return key;
+  } catch {
+    return null;
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /*                              D1 JOB HELPERS                                */
 /* -------------------------------------------------------------------------- */
@@ -1391,6 +1410,7 @@ async function getJobItem(
         title,
         text_length,
         final_url,
+        result_key,
         error,
         duration_ms,
         created_at,
@@ -1430,6 +1450,7 @@ async function saveItemResult(
   itemId,
   result
 ) {
+  const resultKey = await persistResultToR2(env, jobId, itemId, result);
   const itemStatus =
     result.success
       ? "completed"
@@ -1445,6 +1466,7 @@ async function saveItemResult(
         text = ?,
         text_length = ?,
         final_url = ?,
+        result_key = ?,
         extractor = ?,
         extraction_json = ?,
         extraction_ms = ?,
@@ -1463,6 +1485,7 @@ async function saveItemResult(
       result.text || null,
       result.textLength || 0,
       result.finalUrl || null,
+      resultKey,
       result.extractor || null,
       result.extraction
         ? JSON.stringify(result.extraction)
@@ -1978,6 +2001,7 @@ async function handleGetJobResults(
       title,
       text_length,
       final_url,
+      result_key,
       error,
       duration_ms,
       created_at,
@@ -2032,6 +2056,29 @@ async function handleGetJobResults(
         };
       })
   });
+}
+
+async function handleCreateResearchJob(request, env) {
+  const response = await handleCreateJob(request, env);
+  if (!response.ok) return response;
+
+  const body = await response.json();
+  return json({
+    ...body,
+    api: "research",
+    statusUrl: `/research-jobs/${body.jobId}`,
+    resultsUrl: `/research-jobs/${body.jobId}/results`
+  }, response.status);
+}
+
+async function handleResearchScrapeRequest(request, env) {
+  const response = await handleScrapeManyRequest(request, env);
+  const body = await response.json();
+  return json({
+    ...body,
+    api: "research",
+    mode: "research_synchronous"
+  }, response.status);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2717,24 +2764,31 @@ export default {
       return handleWarmPools(request, env);
     }
 
-    if (
-      request.method === "POST" &&
-      pathname === "/scrape-many"
-    ) {
+    if (request.method === "POST" && pathname === "/research-scrape") {
+      return handleResearchScrapeRequest(request, env);
+    }
+
+    if (request.method === "POST" && pathname === "/scrape-many") {
       return handleScrapeManyRequest(
         request,
         env
       );
     }
 
-    if (
-      request.method === "POST" &&
-      pathname === "/jobs"
-    ) {
+    if (request.method === "POST" && pathname === "/research-jobs") {
+      return handleCreateResearchJob(request, env);
+    }
+
+    if (request.method === "POST" && pathname === "/jobs") {
       return handleCreateJob(
         request,
         env
       );
+    }
+
+    const researchResultsMatch = pathname.match(/^\/research-jobs\/([^/]+)\/results$/);
+    if (request.method === "GET" && researchResultsMatch) {
+      return handleGetJobResults(request, env, decodeURIComponent(researchResultsMatch[1]));
     }
 
     const resultsMatch =
@@ -2753,6 +2807,11 @@ export default {
           resultsMatch[1]
         )
       );
+    }
+
+    const researchJobMatch = pathname.match(/^\/research-jobs\/([^/]+)$/);
+    if (request.method === "GET" && researchJobMatch) {
+      return handleGetJob(env, decodeURIComponent(researchJobMatch[1]));
     }
 
     const jobMatch =
@@ -2806,14 +2865,22 @@ export default {
             "GET /?url=https://example.com",
           scrapeMany:
             "POST /scrape-many — tek cevapta en fazla 20 URL",
+          researchScrape:
+            "POST /research-scrape — araştırma senkron akışı",
           batch:
             "POST /batch — tek cevapta en fazla 5 URL",
           createJob:
             "POST /jobs — arka planda en fazla 100 URL",
+          researchJobs:
+            "POST /research-jobs — araştırma async akışı",
           jobStatus:
             "GET /jobs/:jobId",
           jobResults:
             "GET /jobs/:jobId/results",
+          researchJobStatus:
+            "GET /research-jobs/:jobId",
+          researchJobResults:
+            "GET /research-jobs/:jobId/results",
           fullJobResults:
             "GET /jobs/:jobId/results?includeText=1"
         }

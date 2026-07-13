@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS job_items (
   text TEXT,
   text_length INTEGER DEFAULT 0,
   final_url TEXT,
+  result_key TEXT,
   extractor TEXT,
   extraction_json TEXT,
   extraction_ms INTEGER DEFAULT 0,

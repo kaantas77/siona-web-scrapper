@@ -21,6 +21,14 @@
 	  }
 	],
   
+	"r2_buckets": [
+	  {
+		"binding": "RESULTS",
+		"bucket_name": "siona-scrape-results",
+		"remote": true
+	  }
+	],
+
 	"durable_objects": {
 	  "bindings": [
 		{ "name": "BROWSER_POOL", "class_name": "BrowserPool" },
